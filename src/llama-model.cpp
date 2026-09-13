@@ -582,12 +582,17 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (is_dsv4) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+            // G2 (2026-09-01): mirror the lm_head so the DFlash draft (which
+            // references the target's output.weight via ctx_other) gets full
+            // logits rows for its selector TOP_K. Cost: each device stores a
+            // full copy of the lm_head and computes full logits.
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
         if (std::regex_match(tensor_name, pattern_output_bias)) {
             const ggml_tensor * output_weight = ud->model->get_tensor("output.weight");
             GGML_ASSERT(output_weight != nullptr);
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+            // G2: mirror the bias to match the mirrored lm_head
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
 
         // everything else

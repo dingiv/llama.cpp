@@ -2489,6 +2489,19 @@ common_params common_base_params_to_speculative(const common_params & params) {
             result.split_mode = LLAMA_SPLIT_MODE_LAYER;
         }
 
+        // G4' (2026-09-13): force the draft to LAYER split on multi-GPU setups as well.
+        // A small draft model gains nothing from tensor split's per-layer parallelism
+        // but pays the full per-layer allreduce chain (measured ~3-5ms/cycle on a
+        // 1.1GB DFlash2 draft over 2x3090Ti + NCCL P2P). LAYER split drops the
+        // draft's allreduce entirely while keeping the shared meta device visible,
+        // so cross-model references (target output.weight / tok_embd) keep resolving.
+        // Note: a single-device draft still hits the "pre-allocated tensor (output.weight)
+        // in a buffer (Meta())" abort in ggml_backend_sched_backend_id_from_cur -
+        // cross-model tensor copies (B1) would be needed for that configuration.
+        if (n_devs > 1 && result.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+            result.split_mode = LLAMA_SPLIT_MODE_LAYER;
+        }
+
         if (params_spec.cpuparams.n_threads > 0) {
             result.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
             result.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
