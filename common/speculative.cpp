@@ -11,6 +11,7 @@
 #include "sampling.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
+#include "../src/llama-model.h" // B1-final: draft-private copies of shared output/tok_embd
 
 #include <algorithm>
 #include <cassert>
@@ -1050,6 +1051,77 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
+
+        // B1-final (2026-09-13): draft-private copies of the target-shared tensors.
+        // When the draft runs on its own single device (G4 --spec-draft-device), the shared
+        // tok_embd/output live in the target's meta buffer, so every draft graph gets an extra
+        // meta split (tensor-split fanout on both GPUs, ~3 ms of dispatch per rebuild, and the
+        // CUDA-graph warmup never settles). Copy them once onto the draft device: the graph
+        // stays single-backend, splits drop to 1, and both alternating graphs (inject/noise)
+        // can keep warm CUDA graphs. Costs ~1.4 GB (Q4) on the draft device.
+        do {
+            auto * model_dft = const_cast<llama_model *>(llama_get_model(ctx_dft));
+            const auto * model_tgt = llama_get_model(this->params.ctx_tgt);
+
+            if (model_dft->devices.size() != 1 || model_dft->output != nullptr ||
+                    model_tgt == nullptr || model_tgt->output == nullptr) {
+                break;
+            }
+
+            auto make_private = [&](const ggml_tensor * t_src) -> ggml_tensor * {
+                if (t_src == nullptr) {
+                    return nullptr;
+                }
+
+                const size_t nbytes = ggml_nbytes(t_src);
+
+                ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(model_dft->devices[0].dev);
+                ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, nbytes);
+                if (buf == nullptr) {
+                    return nullptr;
+                }
+                ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+                // permanent allocation (process lifetime, same as model weights)
+                auto * t = (ggml_tensor *) calloc(1, sizeof(ggml_tensor));
+                t->type = t_src->type;
+                for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+                    t->ne[i] = t_src->ne[i];
+                }
+                t->nb[0] = ggml_type_size(t->type);
+                t->nb[1] = t->nb[0] * (t->ne[0] / ggml_blck_size(t->type));
+                for (int i = 2; i < GGML_MAX_DIMS; ++i) {
+                    t->nb[i] = t->nb[i - 1] * t->ne[i - 1];
+                }
+                t->buffer = buf;
+                t->data = ggml_backend_buffer_get_base(buf);
+                ggml_format_name(t, "%s (draft-private)", t_src->name);
+
+                // one-shot copy through host staging (meta src splice-reads + syncs)
+                std::vector<uint8_t> host(nbytes);
+                ggml_backend_tensor_get(const_cast<ggml_tensor *>(t_src), host.data(), 0, nbytes);
+                ggml_backend_tensor_set(t, host.data(), 0, nbytes);
+
+                return t;
+            };
+
+            model_dft->output = make_private(model_tgt->output);
+            if (model_dft->output == nullptr) {
+                LOG_WRN("%s: failed to allocate draft-private output.weight, keeping the shared tensor\n", __func__);
+                break;
+            }
+            if (model_tgt->output_s != nullptr) {
+                model_dft->output_s = make_private(model_tgt->output_s);
+            }
+            if (model_dft->tok_embd == nullptr && model_tgt->tok_embd != nullptr) {
+                model_dft->tok_embd = make_private(model_tgt->tok_embd);
+            }
+
+            LOG_INF("%s: draft-private copies of the target-shared output/tok_embd allocated (%.2f GiB)\n",
+                    __func__, (ggml_nbytes(model_dft->output) +
+                    (model_dft->tok_embd ? ggml_nbytes(model_dft->tok_embd) : 0) +
+                    (model_dft->output_s ? ggml_nbytes(model_dft->output_s) : 0)) / 1024.0 / 1024.0 / 1024.0);
+        } while (false);
     }
 
     ~common_speculative_impl_draft_dflash() override {

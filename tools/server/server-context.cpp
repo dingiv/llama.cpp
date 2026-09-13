@@ -506,7 +506,12 @@ struct server_slot {
     }
 
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
-    void handle_last_sampled_token(server_batch & batch) {
+    // n_pad (B1): pad the spec rows up to this many draft tokens so the verify batch always has
+    // the full width. A stable ne[1] and n_outputs keeps the llama graph cache, the sched/galloc
+    // plan and the CUDA graph warm across cycles (ref #27009). The dummy rows are never sampled
+    // (spec_i_batch stops at the real draft rows) and their KV cells are wiped by the same
+    // seq_rm rollback that already cleans rejected draft rows, so the output is unchanged.
+    void handle_last_sampled_token(server_batch & batch, int32_t n_pad = 0) {
         bool add_ok = true;
         if (spec_draft.empty()) {
             // no speculative decoding
@@ -536,6 +541,13 @@ struct server_slot {
             add_ok &= batch.add(id, sampled, pos0++, true, false);
             for (auto token : spec_draft) {
                 add_ok &= batch.add(this->id, token, pos0++, true, false);
+            }
+
+            // B1 (2026-09-13): pad the remaining rows with dummy tokens (logits on, so n_outputs
+            // stays equal to the width). Capped by the space left in the slot's context.
+            n_pad = std::min(n_pad, get_n_draft_max());
+            for (int32_t i = (int32_t) spec_draft.size(); i < n_pad; ++i) {
+                add_ok &= batch.add(this->id, (llama_token) 0, pos0++, true, false);
             }
         }
 
@@ -3102,8 +3114,9 @@ private:
         });
 
         // update the batch with the sampled/drafted tokens
+        const int32_t n_spec_pad = spec ? common_speculative_n_max(spec.get()) : 0;
         iterate(generating, [&](server_slot & slot) {
-            slot.handle_last_sampled_token(batch);
+            slot.handle_last_sampled_token(batch, n_spec_pad);
         });
 
         // process in chunks of params.n_batch
@@ -3694,6 +3707,15 @@ private:
                 server_ctx_p0.t_sync_us += ggml_time_us() - p0_t2; // P0: sync 等待 = GPU 尾部实算
             }
         });
+        // P0W (2026-09-13): verify 宽度直方图(定位 B1 padding 是否生效)
+        static int wcnt[17] = {0};
+        if (has_output && batch_view.n_tokens <= 16) {
+            wcnt[batch_view.n_tokens]++;
+            if (server_ctx_p0.n_cycles % 64 == 0) {
+                fprintf(stderr, "[P0W] widths: 1=%d 2=%d 3=%d 4=%d 5=%d 6=%d 8=%d 10=%d 13=%d 16=%d\n",
+                        wcnt[1], wcnt[2], wcnt[3], wcnt[4], wcnt[5], wcnt[6], wcnt[8], wcnt[10], wcnt[13], wcnt[16]);
+            }
+        }
         if (p0_is_verify) {
             server_ctx_p0.t_verify_us += ggml_time_us() - p0_t1;
             if (++server_ctx_p0.n_cycles % 64 == 0) {
