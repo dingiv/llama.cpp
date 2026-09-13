@@ -17,6 +17,7 @@
 #include <set>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include <atomic>
@@ -1807,6 +1808,63 @@ struct ggml_backend_meta_context {
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
 
+    // -----------------------------------------------------------------------
+    // G7-③-capture: whole-fanout CUDA graph ("big graph") support.
+    //
+    // The fanout of all per-device subgraphs (subgraph computations + NCCL
+    // allreduces) is captured into a single CUDA graph spanning all member
+    // devices; steady-state cycles replay it with one launch instead of
+    // n_subgraphs*n_backends host-side dispatches.  All CUDA handles are
+    // opaque void* resolved through proc_address so the meta backend stays
+    // backend-agnostic.
+    // -----------------------------------------------------------------------
+    typedef int (* meta_capture_multi_fn)(ggml_backend_t *, size_t, int (*)(void *), void *, void **);
+    typedef int (* meta_exec_create_fn)  (ggml_backend_t, void *, void **);
+    typedef int (* meta_exec_launch_fn)  (ggml_backend_t, void *);
+    typedef int (* meta_exec_destroy_fn) (ggml_backend_t, void *);
+    typedef int (* meta_exec_update_fn)  (ggml_backend_t, void *, void *);
+    typedef int (* meta_graph_destroy_fn)(ggml_backend_t, void *);
+
+    // The verify topology is shape-stable (B1' padding), so every rebuild
+    // re-captures the same node structure with fresh argument pointers.
+    // Instead of paying cudaGraphInstantiate (8-27ms) on each re-capture, a
+    // single shared exec is kept alive and refreshed in place with
+    // cudaGraphExecUpdate (~1-3ms), falling back to a fresh instantiate when
+    // the topology actually changes.
+    struct meta_big_graph {
+        uint64_t replays  = 0;
+        int64_t  last_use = 0;
+    };
+
+    meta_capture_multi_fn big_capture_multi = nullptr;
+    meta_exec_create_fn   big_exec_create   = nullptr;
+    meta_exec_launch_fn   big_exec_launch   = nullptr;
+    meta_exec_destroy_fn  big_exec_destroy  = nullptr;
+    meta_exec_update_fn   big_exec_update   = nullptr;
+    meta_graph_destroy_fn big_graph_destroy = nullptr;
+
+    void * big_exec = nullptr; // single shared executable, updated in place
+
+    std::unordered_map<uint64_t, meta_big_graph> big_graphs; // keyed by cgraph->uid
+    uint64_t big_last_uid   = 0;
+    uint64_t big_uid_streak = 0;
+    int      big_failures   = 0;
+    bool     big_disabled   = false; // sticky off after repeated failures
+    bool     big_enabled    = false; // opt-in via GGML_META_BIG_GRAPH=1 (A/B: parity-to-negative)
+
+    void big_graph_release(const uint64_t uid) {
+        // Note: the shared big_exec is intentionally kept alive — it can be
+        // refreshed in place by the next capture via exec_update.
+        big_graphs.erase(uid);
+    }
+
+    void big_exec_release() {
+        if (big_exec != nullptr && big_exec_destroy != nullptr) {
+            big_exec_destroy(backend_configs[0].backend, big_exec);
+        }
+        big_exec = nullptr;
+    }
+
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
         n_reduce_steps = std::ceil(std::log2(n_devs));
@@ -1838,9 +1896,45 @@ struct ggml_backend_meta_context {
                     ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
             GGML_ASSERT(comm_allreduce != nullptr);
         }
+
+        // G7-③-capture: resolve the whole-fanout big-graph procs from the first
+        // member backend's registry (CUDA-only feature; absent procs leave the
+        // feature off).  Disabled by default: A/B measured the big graph at
+        // parity-to-slightly-negative (119.6 vs 123.0 median, decode 192x5)
+        // because the fanout dispatch tax it removes largely overlaps GPU
+        // execution, while capture amortisation (~12-16ms per L1-miss cycle)
+        // and the ~400us cross-device graph launch eat the rest.  Kept as
+        // infrastructure: GGML_META_BIG_GRAPH=1 enables it at runtime.
+        {
+            const char * env = getenv("GGML_META_BIG_GRAPH");
+            big_enabled = (env != nullptr && strcmp(env, "1") == 0);
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0]));
+            big_capture_multi = (meta_capture_multi_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_capture_multi");
+            big_exec_create   = (meta_exec_create_fn)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_exec_create");
+            big_exec_launch   = (meta_exec_launch_fn)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_exec_launch");
+            big_exec_destroy  = (meta_exec_destroy_fn)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_exec_destroy");
+            big_exec_update   = (meta_exec_update_fn)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_exec_update");
+            big_graph_destroy = (meta_graph_destroy_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_graph_destroy");
+            if (big_capture_multi == nullptr || big_exec_create == nullptr || big_exec_launch == nullptr ||
+                big_exec_destroy == nullptr || big_graph_destroy == nullptr) {
+                // Feature unavailable (e.g. non-CUDA member backend or graphs
+                // compiled out): leave big_capture_multi null to disable.
+                big_capture_multi = nullptr;
+                big_exec_create   = nullptr;
+                big_exec_launch   = nullptr;
+                big_exec_destroy  = nullptr;
+                big_graph_destroy = nullptr;
+            }
+        }
     }
 
     ~ggml_backend_meta_context() {
+        for (auto it = big_graphs.begin(); it != big_graphs.end(); ) {
+            const uint64_t uid = it->first;
+            big_graph_release(uid);
+            it = big_graphs.begin(); // release() erased the entry
+        }
+        big_exec_release();
         if (comm_ctx != nullptr) {
             ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
                 ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
@@ -1962,6 +2056,237 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
         ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, i));
     }
 }
+
+// G7-③-capture: dispatch the per-device subgraphs + allreduce (the legacy
+// fanout).  Extracted from graph_compute so the exact same code can also
+// serve as the capture body when building a whole-fanout big graph.
+static ggml_status ggml_backend_meta_fanout(ggml_backend_meta_context * backend_ctx, size_t n_backends) {
+    size_t iga = 0; // i graph aux
+    size_t ina = 0; // i node aux
+
+    auto get_node_aux = [&](ggml_tensor * t) -> ggml_tensor * {
+        ggml_tensor * ret = backend_ctx->nodes_aux[ina++];
+        memset(ret, 0, sizeof(ggml_tensor));
+        ret->op   = GGML_OP_NONE;
+        ret->type = t->type;
+        for (size_t k = 0; k < GGML_MAX_DIMS; k++) {
+            ret->ne[k] = t->ne[k];
+            ret->nb[k] = t->nb[k];
+        }
+        return ret;
+    };
+    auto set_tmp_data = [&](ggml_tensor * tensor, const size_t j, const size_t i_buf) {
+        auto & bcj = backend_ctx->backend_configs[j];
+        ggml_backend_buffer_ptr & buf_ptr = bcj.bufs[i_buf];
+        if (!buf_ptr || ggml_backend_buffer_get_size(buf_ptr.get()) < backend_ctx->max_tmp_size) {
+            buf_ptr.reset(ggml_backend_alloc_buffer(bcj.backend, backend_ctx->max_tmp_size));
+        }
+        tensor->buffer = buf_ptr.get();
+        tensor->data   = ggml_backend_buffer_get_base(buf_ptr.get());
+    };
+    // FIXME usage_counts
+    auto get_cgraph_aux = [&]() -> ggml_cgraph * {
+        ggml_cgraph * ret = backend_ctx->cgraphs_aux[iga++];
+        return ret;
+    };
+
+    // Preferentially use backend-specific allreduce_tensor_async (e.g. NCCL for CUDA), use a generic fallback if unavailable:
+    auto allreduce_fallback = [&](size_t i) -> ggml_status {
+        std::vector<ggml_cgraph *> step_cgraphs(n_backends, nullptr);
+
+        // Zero out nodes that were disabled due to having a zero-sized slice:
+        for (size_t j = 0; j < n_backends; j++) {
+            auto & bcj = backend_ctx->backend_configs[j];
+            ggml_tensor * node = bcj.cgraphs[i].cgraph_main->nodes[bcj.cgraphs[i].cgraph_main->n_nodes - 1];
+            if (node->flags & GGML_TENSOR_FLAG_COMPUTE) {
+                continue;
+            }
+            ggml_tensor * node_zero = get_node_aux(node);
+            node_zero->op = GGML_OP_SCALE; // FIXME 0.0f * NaN == NaN
+            node_zero->src[0] = node;
+            ggml_set_op_params_f32(node_zero, 0, 0.0f);
+            node_zero->data = node->data;
+            node_zero->buffer = node->buffer;
+            node_zero->flags |= GGML_TENSOR_FLAG_COMPUTE;
+
+            step_cgraphs[j] = get_cgraph_aux();
+            step_cgraphs[j]->nodes[0] = node_zero;
+            step_cgraphs[j]->n_nodes = 1;
+            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[j]);
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
+        }
+        std::fill(step_cgraphs.begin(), step_cgraphs.end(), nullptr);
+
+        auto push_data = [&](const size_t j_src, const size_t j_dst, const size_t i_buf) {
+            assert(step_cgraphs[j_dst] == nullptr);
+            auto & bcj_src = backend_ctx->backend_configs[j_src];
+            auto & bcj_dst = backend_ctx->backend_configs[j_dst];
+
+            ggml_tensor * node_src = bcj_src.cgraphs[i].cgraph_main->nodes[bcj_src.cgraphs[i].cgraph_main->n_nodes - 1];
+            ggml_tensor * node_dst = bcj_dst.cgraphs[i].cgraph_main->nodes[bcj_dst.cgraphs[i].cgraph_main->n_nodes - 1];
+            GGML_ASSERT(ggml_is_contiguous(node_src));
+            GGML_ASSERT(ggml_is_contiguous(node_dst));
+
+            ggml_tensor * node_tmp = get_node_aux(node_dst);
+            set_tmp_data(node_tmp, j_dst, i_buf);
+
+            ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_tmp);
+
+            ggml_tensor * node_red = get_node_aux(node_dst);
+            node_red->view_src = node_dst->view_src == nullptr ? node_dst : node_dst->view_src;
+            node_red->view_offs = node_dst->view_offs;
+            node_red->op = GGML_OP_ADD;
+            node_red->src[0] = node_dst;
+            node_red->src[1] = node_tmp;
+            node_red->flags |= GGML_TENSOR_FLAG_COMPUTE;
+            ggml_backend_view_init(node_red);
+
+            ggml_cgraph * cgraph_aux = get_cgraph_aux();
+            cgraph_aux->nodes[0] = node_red;
+            cgraph_aux->n_nodes = 1;
+            step_cgraphs[j_dst] = cgraph_aux;
+        };
+
+        size_t offset_j = n_backends/2;
+        while ((offset_j & (offset_j - 1)) != 0) {
+            offset_j--;
+        }
+        const size_t offset_j_max = offset_j;
+        size_t i_buf = 0;
+
+        // If n_backends is not a power of 2, fold in the excess prior to butterfly reduction:
+        for (size_t j_src = 2*offset_j_max; j_src < n_backends; j_src++) {
+            const size_t j_dst = j_src - 2*offset_j_max;
+            push_data(j_src, j_dst, i_buf);
+            const ggml_status status = ggml_backend_graph_compute_async(backend_ctx->backend_configs[j_dst].backend, step_cgraphs[j_dst]);
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
+            i_buf = 1;
+        }
+
+        // Butterfly reduction:
+        for (; offset_j >= 1; offset_j /= 2) {
+            std::fill(step_cgraphs.begin(), step_cgraphs.end(), nullptr);
+
+            for (size_t j = 0; j < 2*offset_j_max; j++) {
+                const size_t j_other = j ^ offset_j;
+                if (j_other >= n_backends) {
+                    continue;
+                }
+                push_data(j, j_other, i_buf);
+            }
+
+            for (size_t j = 0; j < 2*offset_j_max; j++) {
+                if (step_cgraphs[j] == nullptr) {
+                    continue;
+                }
+                auto & bcj = backend_ctx->backend_configs[j];
+                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[j]);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
+            }
+            i_buf++;
+        }
+        assert(i_buf == backend_ctx->n_reduce_steps);
+
+        // If n_backends is not a power of 2, copy back the reduced tensors to the excess:
+        for (size_t j = 2*offset_j_max; j < n_backends; j++) {
+            auto & bcj_src = backend_ctx->backend_configs[j - 2*offset_j_max];
+            auto & bcj_dst = backend_ctx->backend_configs[j];
+
+            ggml_tensor * node_src = bcj_src.cgraphs[i].cgraph_main->nodes[bcj_src.cgraphs[i].cgraph_main->n_nodes - 1];
+            ggml_tensor * node_dst = bcj_dst.cgraphs[i].cgraph_main->nodes[bcj_dst.cgraphs[i].cgraph_main->n_nodes - 1];
+            ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_dst);
+        }
+
+        return GGML_STATUS_SUCCESS;
+    };
+
+
+    // fanout: dispatch per-device subgraphs + allreduce(P0M2 在函数尾计全函数耗时)
+    for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+        for (size_t j = 0; j < n_backends; j++) {
+            auto & bcj = backend_ctx->backend_configs[j];
+            const int64_t p0f_t0 = ggml_time_us(); // P0F: fanout 内逐设备计时
+            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
+            const int64_t p0f_dt = ggml_time_us() - p0f_t0;
+            {
+                static std::atomic<int64_t> p0f_n{0}, p0f_sum{0};
+                p0f_sum.fetch_add(p0f_dt, std::memory_order_relaxed);
+                if (p0f_n.fetch_add(1, std::memory_order_relaxed) % 1024 == 0) {
+                    TRACELOG("P0M", "[P0F] fanout_launch n=%lld avg=%.3fms\n", (long long) p0f_n.load(), p0f_sum.load() / 1024000.0);
+                    p0f_sum.store(0);
+                }
+            }
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
+        }
+
+        if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
+            bool backend_allreduce_success = false;
+            if (backend_ctx->comm_ctx) {
+                std::vector<ggml_tensor *> nodes;
+                nodes.reserve(n_backends);
+                for (size_t j = 0; j < n_backends; j++) {
+                    auto & bcj = backend_ctx->backend_configs[j];
+                    ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
+                    nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes-1]);
+                }
+                backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
+            }
+
+            if (!backend_allreduce_success) {
+                const ggml_status status = allreduce_fallback(i);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
+            }
+        }
+    }
+
+    return GGML_STATUS_SUCCESS;
+}
+
+// G7-③-capture: C-callable trampoline so ggml_backend_meta_fanout can run
+// as the capture body of ggml_backend_cuda_capture_multi.
+struct ggml_backend_meta_fanout_ud {
+    ggml_backend_meta_context * backend_ctx;
+    size_t n_backends;
+};
+
+static int ggml_backend_meta_fanout_body(void * ud) {
+    auto * u = (ggml_backend_meta_fanout_ud *) ud;
+    return (int) ggml_backend_meta_fanout(u->backend_ctx, u->n_backends);
+}
+
+// The NCCL allreduce switches to a BF16 reduction backed by host-managed CUDA
+// pool allocations for large tensors; those pool pointers are not replay-safe
+// inside a captured graph.  Only capture graphs whose every allreduce boundary
+// stays on the small-tensor FP32 path (memset + collective, no pool).
+// Thresholds mirror ggml_backend_cuda_comm_allreduce_nccl.
+static bool ggml_backend_meta_fanout_allreduce_fp32_only(const ggml_backend_meta_context * backend_ctx, size_t n_backends) {
+    const int64_t ne_threshold = (n_backends <= 2) ? 32768 : (n_backends == 3 ? 131072 : 262144);
+    for (size_t i = 0; i + 1 < backend_ctx->n_subgraphs; i++) {
+        const ggml_cgraph * cg = backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
+        const ggml_tensor * node = cg->nodes[cg->n_nodes - 1];
+        if (ggml_nelements(node) >= ne_threshold) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Re-capture a big graph after this many replays: the validation cycle drops
+// the entry, runs one legacy fanout (re-exercising every per-subgraph check)
+// and a fresh capture follows.  Amortised cost ≈ capture_time/512 per cycle.
+static const uint64_t GGML_META_BIG_VALIDATE_EVERY = 512;
+// How many cgraph uids may keep a cached big graph (decode/prefill alternation).
+static const size_t GGML_META_BIG_MAX_ENTRIES = 4;
 
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(cgraph->grads == nullptr);
@@ -2302,152 +2627,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
     }
 
-    size_t iga = 0; // i graph aux
-    size_t ina = 0; // i node aux
-
-    auto get_node_aux = [&](ggml_tensor * t) -> ggml_tensor * {
-        ggml_tensor * ret = backend_ctx->nodes_aux[ina++];
-        memset(ret, 0, sizeof(ggml_tensor));
-        ret->op   = GGML_OP_NONE;
-        ret->type = t->type;
-        for (size_t k = 0; k < GGML_MAX_DIMS; k++) {
-            ret->ne[k] = t->ne[k];
-            ret->nb[k] = t->nb[k];
-        }
-        return ret;
-    };
-    auto set_tmp_data = [&](ggml_tensor * tensor, const size_t j, const size_t i_buf) {
-        auto & bcj = backend_ctx->backend_configs[j];
-        ggml_backend_buffer_ptr & buf_ptr = bcj.bufs[i_buf];
-        if (!buf_ptr || ggml_backend_buffer_get_size(buf_ptr.get()) < backend_ctx->max_tmp_size) {
-            buf_ptr.reset(ggml_backend_alloc_buffer(bcj.backend, backend_ctx->max_tmp_size));
-        }
-        tensor->buffer = buf_ptr.get();
-        tensor->data   = ggml_backend_buffer_get_base(buf_ptr.get());
-    };
-    // FIXME usage_counts
-    auto get_cgraph_aux = [&]() -> ggml_cgraph * {
-        ggml_cgraph * ret = backend_ctx->cgraphs_aux[iga++];
-        return ret;
-    };
-
-    // Preferentially use backend-specific allreduce_tensor_async (e.g. NCCL for CUDA), use a generic fallback if unavailable:
-    auto allreduce_fallback = [&](size_t i) -> ggml_status {
-        std::vector<ggml_cgraph *> step_cgraphs(n_backends, nullptr);
-
-        // Zero out nodes that were disabled due to having a zero-sized slice:
-        for (size_t j = 0; j < n_backends; j++) {
-            auto & bcj = backend_ctx->backend_configs[j];
-            ggml_tensor * node = bcj.cgraphs[i].cgraph_main->nodes[bcj.cgraphs[i].cgraph_main->n_nodes - 1];
-            if (node->flags & GGML_TENSOR_FLAG_COMPUTE) {
-                continue;
-            }
-            ggml_tensor * node_zero = get_node_aux(node);
-            node_zero->op = GGML_OP_SCALE; // FIXME 0.0f * NaN == NaN
-            node_zero->src[0] = node;
-            ggml_set_op_params_f32(node_zero, 0, 0.0f);
-            node_zero->data = node->data;
-            node_zero->buffer = node->buffer;
-            node_zero->flags |= GGML_TENSOR_FLAG_COMPUTE;
-
-            step_cgraphs[j] = get_cgraph_aux();
-            step_cgraphs[j]->nodes[0] = node_zero;
-            step_cgraphs[j]->n_nodes = 1;
-            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[j]);
-            if (status != GGML_STATUS_SUCCESS) {
-                return status;
-            }
-        }
-        std::fill(step_cgraphs.begin(), step_cgraphs.end(), nullptr);
-
-        auto push_data = [&](const size_t j_src, const size_t j_dst, const size_t i_buf) {
-            assert(step_cgraphs[j_dst] == nullptr);
-            auto & bcj_src = backend_ctx->backend_configs[j_src];
-            auto & bcj_dst = backend_ctx->backend_configs[j_dst];
-
-            ggml_tensor * node_src = bcj_src.cgraphs[i].cgraph_main->nodes[bcj_src.cgraphs[i].cgraph_main->n_nodes - 1];
-            ggml_tensor * node_dst = bcj_dst.cgraphs[i].cgraph_main->nodes[bcj_dst.cgraphs[i].cgraph_main->n_nodes - 1];
-            GGML_ASSERT(ggml_is_contiguous(node_src));
-            GGML_ASSERT(ggml_is_contiguous(node_dst));
-
-            ggml_tensor * node_tmp = get_node_aux(node_dst);
-            set_tmp_data(node_tmp, j_dst, i_buf);
-
-            ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_tmp);
-
-            ggml_tensor * node_red = get_node_aux(node_dst);
-            node_red->view_src = node_dst->view_src == nullptr ? node_dst : node_dst->view_src;
-            node_red->view_offs = node_dst->view_offs;
-            node_red->op = GGML_OP_ADD;
-            node_red->src[0] = node_dst;
-            node_red->src[1] = node_tmp;
-            node_red->flags |= GGML_TENSOR_FLAG_COMPUTE;
-            ggml_backend_view_init(node_red);
-
-            ggml_cgraph * cgraph_aux = get_cgraph_aux();
-            cgraph_aux->nodes[0] = node_red;
-            cgraph_aux->n_nodes = 1;
-            step_cgraphs[j_dst] = cgraph_aux;
-        };
-
-        size_t offset_j = n_backends/2;
-        while ((offset_j & (offset_j - 1)) != 0) {
-            offset_j--;
-        }
-        const size_t offset_j_max = offset_j;
-        size_t i_buf = 0;
-
-        // If n_backends is not a power of 2, fold in the excess prior to butterfly reduction:
-        for (size_t j_src = 2*offset_j_max; j_src < n_backends; j_src++) {
-            const size_t j_dst = j_src - 2*offset_j_max;
-            push_data(j_src, j_dst, i_buf);
-            const ggml_status status = ggml_backend_graph_compute_async(backend_ctx->backend_configs[j_dst].backend, step_cgraphs[j_dst]);
-            if (status != GGML_STATUS_SUCCESS) {
-                return status;
-            }
-            i_buf = 1;
-        }
-
-        // Butterfly reduction:
-        for (; offset_j >= 1; offset_j /= 2) {
-            std::fill(step_cgraphs.begin(), step_cgraphs.end(), nullptr);
-
-            for (size_t j = 0; j < 2*offset_j_max; j++) {
-                const size_t j_other = j ^ offset_j;
-                if (j_other >= n_backends) {
-                    continue;
-                }
-                push_data(j, j_other, i_buf);
-            }
-
-            for (size_t j = 0; j < 2*offset_j_max; j++) {
-                if (step_cgraphs[j] == nullptr) {
-                    continue;
-                }
-                auto & bcj = backend_ctx->backend_configs[j];
-                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[j]);
-                if (status != GGML_STATUS_SUCCESS) {
-                    return status;
-                }
-            }
-            i_buf++;
-        }
-        assert(i_buf == backend_ctx->n_reduce_steps);
-
-        // If n_backends is not a power of 2, copy back the reduced tensors to the excess:
-        for (size_t j = 2*offset_j_max; j < n_backends; j++) {
-            auto & bcj_src = backend_ctx->backend_configs[j - 2*offset_j_max];
-            auto & bcj_dst = backend_ctx->backend_configs[j];
-
-            ggml_tensor * node_src = bcj_src.cgraphs[i].cgraph_main->nodes[bcj_src.cgraphs[i].cgraph_main->n_nodes - 1];
-            ggml_tensor * node_dst = bcj_dst.cgraphs[i].cgraph_main->nodes[bcj_dst.cgraphs[i].cgraph_main->n_nodes - 1];
-            ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_dst);
-        }
-
-        return GGML_STATUS_SUCCESS;
-    };
-
-
     // P0M (2026-09-13 B3): meta 全函数 + rebuild/skip 计数直写
     {
         {
@@ -2470,49 +2649,159 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             p0m_ft.store(0); p0m_rebuilds.store(0); p0m_ns.store(0);
         }
     }
-    // fanout: dispatch per-device subgraphs + allreduce(P0M2 在函数尾计全函数耗时)
-    for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
-        for (size_t j = 0; j < n_backends; j++) {
-            auto & bcj = backend_ctx->backend_configs[j];
-            const int64_t p0f_t0 = ggml_time_us(); // P0F: fanout 内逐设备计时
-            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
-            const int64_t p0f_dt = ggml_time_us() - p0f_t0;
-            {
-                static std::atomic<int64_t> p0f_n{0}, p0f_sum{0};
-                p0f_sum.fetch_add(p0f_dt, std::memory_order_relaxed);
-                if (p0f_n.fetch_add(1, std::memory_order_relaxed) % 1024 == 0) {
-                    TRACELOG("P0M", "[P0F] fanout_launch n=%lld avg=%.3fms\n", (long long) p0f_n.load(), p0f_sum.load() / 1024000.0);
-                    p0f_sum.store(0);
-                }
-            }
-            if (status != GGML_STATUS_SUCCESS) {
-                return status;
-            }
+    // G7-③-capture: whole-fanout CUDA graph ("big graph") fast path.  One
+    // graph replay per steady cycle replaces n_subgraphs*n_backends host-side
+    // dispatches.  Validity mirrors the per-subgraph uid fast path upstream:
+    // while the cgraph uid is unchanged, the tensor objects (and thus all
+    // kernel argument pointers baked into the graph) are unchanged.
+    if (backend_ctx->big_enabled && backend_ctx->big_capture_multi != nullptr &&
+        !backend_ctx->big_disabled && !needs_rebuild && backend_ctx->n_subgraphs >= 8) {
+
+        // Track consecutive cycles with the same uid: a capture is only
+        // attempted after the uid survived one full legacy fanout (galloc
+        // plan + subgraph views + NCCL comms all settled).
+        if (cgraph->uid == backend_ctx->big_last_uid) {
+            backend_ctx->big_uid_streak++;
+        } else {
+            backend_ctx->big_last_uid   = cgraph->uid;
+            backend_ctx->big_uid_streak = 1;
         }
 
-        if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
-            bool backend_allreduce_success = false;
-            if (backend_ctx->comm_ctx) {
-                std::vector<ggml_tensor *> nodes;
-                nodes.reserve(n_backends);
-                for (size_t j = 0; j < n_backends; j++) {
-                    auto & bcj = backend_ctx->backend_configs[j];
-                    ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
-                    nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes-1]);
-                }
-                backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
-            }
+        static std::atomic<int64_t> p0v_replays{0}, p0v_launch_us{0}, p0v_captures{0}, p0v_capture_us{0}, p0v_inst_us{0}, p0v_updates{0}, p0v_fallbacks{0}, p0v_validations{0};
+        ggml_backend_t backend0 = backend_ctx->backend_configs[0].backend;
 
-            if (!backend_allreduce_success) {
-                const ggml_status status = allreduce_fallback(i);
-                if (status != GGML_STATUS_SUCCESS) {
-                    return status;
+        auto it = backend_ctx->big_graphs.find(cgraph->uid);
+        if (it != backend_ctx->big_graphs.end() && backend_ctx->big_exec != nullptr) {
+            it->second.last_use = ggml_time_us();
+            if (++it->second.replays % GGML_META_BIG_VALIDATE_EVERY == 0) {
+                // Validation cycle: drop the entry and run the legacy fanout
+                // this cycle; a fresh capture follows on a later cycle.
+                TRACELOG("P0V", "[P0V] validate-drop uid=%llu replays=%llu\n",
+                         (unsigned long long) cgraph->uid, (unsigned long long) it->second.replays);
+                backend_ctx->big_graph_release(cgraph->uid);
+                p0v_validations.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                const int64_t t0 = ggml_time_us();
+                const int rc = backend_ctx->big_exec_launch(backend0, backend_ctx->big_exec);
+                p0v_launch_us.fetch_add(ggml_time_us() - t0, std::memory_order_relaxed);
+                if (rc == 0) {
+                    const int64_t n = p0v_replays.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if (n % 64 == 0) {
+                        TRACELOG("P0V", "[P0V] replays=%lld avg_launch_us=%.1f captures=%lld avg_cap_us=%.0f avg_ins_us=%.0f updates=%lld fallbacks=%lld validations=%lld\n",
+                                 (long long) n, p0v_launch_us.load() / 64.0,
+                                 (long long) p0v_captures.load(), p0v_capture_us.load() / 1000.0 / std::max<int64_t>(p0v_captures.load(), 1),
+                                 p0v_inst_us.load() / 1000.0 / std::max<int64_t>(p0v_captures.load(), 1),
+                                 (long long) p0v_updates.load(), (long long) p0v_fallbacks.load(), (long long) p0v_validations.load());
+                        p0v_launch_us.store(0);
+                    }
+                    return GGML_STATUS_SUCCESS;
+                }
+                // Launch failed: fall back to legacy and count the failure.
+                TRACELOG("P0V", "[P0V] exec_launch failed uid=%llu\n", (unsigned long long) cgraph->uid);
+                backend_ctx->big_graph_release(cgraph->uid);
+                backend_ctx->big_exec_release();
+                backend_ctx->big_failures++;
+                if (backend_ctx->big_failures >= 2) {
+                    backend_ctx->big_disabled = true;
+                    TRACELOG("P0V", "[P0V] sticky-disabled after failures\n");
                 }
             }
+        } else if (backend_ctx->big_uid_streak >= 2 &&
+                   ggml_backend_meta_fanout_allreduce_fp32_only(backend_ctx, n_backends)) {
+            // Capture cycle: record the whole fanout (direct-eval subgraphs +
+            // NCCL) into one cross-device graph, instantiate, then launch it
+            // — the launch is the actual execution of this cycle's work
+            // (stream capture records but does not execute).
+            std::vector<ggml_backend_t> backends;
+            backends.reserve(n_backends);
+            for (size_t j = 0; j < n_backends; j++) {
+                backends.push_back(backend_ctx->backend_configs[j].backend);
+            }
+            ggml_backend_meta_fanout_ud ud = { backend_ctx, n_backends };
+            void * graph = nullptr;
+            const int64_t t0 = ggml_time_us();
+            const int crc = backend_ctx->big_capture_multi(backends.data(), backends.size(),
+                                                           ggml_backend_meta_fanout_body, &ud, &graph);
+            const int64_t capture_us = ggml_time_us() - t0;
+            bool launched = false;
+            if (crc == 0 && graph != nullptr) {
+                // Refresh the shared exec in place when possible: same verify
+                // topology -> cudaGraphExecUpdate (~1-3ms) instead of a fresh
+                // cudaGraphInstantiate (8-27ms).  Fall back to instantiate on
+                // the first capture or a topology change.
+                int64_t ins_us = 0;
+                bool exec_ok = false;
+                if (backend_ctx->big_exec != nullptr && backend_ctx->big_exec_update != nullptr) {
+                    const int64_t t_upd0 = ggml_time_us();
+                    exec_ok = backend_ctx->big_exec_update(backend0, backend_ctx->big_exec, graph) == 0;
+                    ins_us = ggml_time_us() - t_upd0;
+                    if (exec_ok) {
+                        p0v_updates.fetch_add(1, std::memory_order_relaxed);
+                        backend_ctx->big_graph_destroy(backend0, graph); // absorbed into the exec
+                        graph = nullptr;
+                    } else {
+                        backend_ctx->big_exec_release(); // topology changed; re-instantiate below
+                    }
+                }
+                if (!exec_ok) {
+                    void * exec = nullptr;
+                    const int64_t t_ins0 = ggml_time_us();
+                    const int ins_rc = backend_ctx->big_exec_create(backend0, graph, &exec);
+                    ins_us += ggml_time_us() - t_ins0;
+                    if (ins_rc == 0 && exec != nullptr) {
+                        backend_ctx->big_exec = exec;
+                        exec_ok = true;
+                        backend_ctx->big_graph_destroy(backend0, graph); // absorbed into the exec
+                        graph = nullptr;
+                    }
+                }
+                if (exec_ok) {
+                    auto & ent = backend_ctx->big_graphs[cgraph->uid];
+                    ent.replays  = 0;
+                    ent.last_use = ggml_time_us();
+                    // LRU cap: evict the stalest entry if above the limit.
+                    while (backend_ctx->big_graphs.size() > GGML_META_BIG_MAX_ENTRIES) {
+                        uint64_t evict_uid = 0;
+                        int64_t evict_age = INT64_MAX;
+                        for (const auto & kv : backend_ctx->big_graphs) {
+                            if (kv.second.last_use < evict_age && kv.first != cgraph->uid) {
+                                evict_age = kv.second.last_use;
+                                evict_uid = kv.first;
+                            }
+                        }
+                        backend_ctx->big_graph_release(evict_uid);
+                    }
+                    if (backend_ctx->big_exec_launch(backend0, backend_ctx->big_exec) == 0) {
+                        launched = true;
+                        backend_ctx->big_failures = 0; // consecutive-failure semantics
+                        p0v_captures.fetch_add(1, std::memory_order_relaxed);
+                        p0v_capture_us.fetch_add(capture_us, std::memory_order_relaxed);
+                        p0v_inst_us.fetch_add(ins_us, std::memory_order_relaxed);
+                        TRACELOG("P0V", "[P0V] captured uid=%llu nsub=%zu capture_us=%lld inst_us=%lld\n",
+                                 (unsigned long long) cgraph->uid, backend_ctx->n_subgraphs, (long long) capture_us, (long long) ins_us);
+                        return GGML_STATUS_SUCCESS;
+                    }
+                    TRACELOG("P0V", "[P0V] fresh exec_launch failed uid=%llu\n", (unsigned long long) cgraph->uid);
+                    backend_ctx->big_graph_release(cgraph->uid);
+                    backend_ctx->big_exec_release();
+                } else {
+                    TRACELOG("P0V", "[P0V] instantiate failed uid=%llu\n", (unsigned long long) cgraph->uid);
+                    backend_ctx->big_graph_destroy(backend0, graph);
+                }
+            }
+            (void) launched;
+            backend_ctx->big_failures++;
+            p0v_fallbacks.fetch_add(1, std::memory_order_relaxed);
+            if (backend_ctx->big_failures >= 2) {
+                backend_ctx->big_disabled = true;
+                TRACELOG("P0V", "[P0V] sticky-disabled after failures\n");
+            }
+            // Nothing executed during the failed capture — the legacy fanout
+            // below performs this cycle's work.
         }
     }
 
-    return GGML_STATUS_SUCCESS;
+    return ggml_backend_meta_fanout(backend_ctx, n_backends);
 }
 
 static const ggml_backend_i ggml_backend_meta_i = {
