@@ -7,6 +7,10 @@
 #include "server-schema.h"
 #include "server-stream.h"
 
+// P0 (2026-09-13): spec-decode 相位分解仪——draft/verify 每 cycle 累计,
+// 每 16 周期直写 stderr(绕过 common_log 缓冲黑洞)。dflash-optimize 临时件。
+static struct { int64_t t_draft_us = 0; int64_t t_verify_us = 0; int64_t t_sync_us = 0; int n_cycles = 0; } server_ctx_p0;
+
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
@@ -3042,9 +3046,11 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            const int64_t p0_t0 = ggml_time_us();
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+            server_ctx_p0.t_draft_us += ggml_time_us() - p0_t0;
         }
 
         // make checkpoints if needed
@@ -3678,12 +3684,29 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        const int64_t p0_t1 = ggml_time_us();
+        const bool p0_is_verify = has_output && batch_view.n_tokens <= 16; // P0: spec verify 的小 batch;prefill ubatch=64 被排除
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
+            const int64_t p0_t2 = (ret == 0 && has_output) ? ggml_time_us() : 0;
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
+                server_ctx_p0.t_sync_us += ggml_time_us() - p0_t2; // P0: sync 等待 = GPU 尾部实算
             }
         });
+        if (p0_is_verify) {
+            server_ctx_p0.t_verify_us += ggml_time_us() - p0_t1;
+            if (++server_ctx_p0.n_cycles % 64 == 0) {
+                // P0 (2026-09-13): 相位分解直写 stderr(绕过 common_log 缓冲黑洞)
+                fprintf(stderr, "[P0] cycles=%d draft_ms=%.1f verify_ms=%.1f sync_ms=%.1f llama_graph_reused=%d | per-cycle draft=%.2fms verify=%.2fms sync=%.2fms\n",
+                        server_ctx_p0.n_cycles,
+                        server_ctx_p0.t_draft_us / 1000.0, server_ctx_p0.t_verify_us / 1000.0, server_ctx_p0.t_sync_us / 1000.0,
+                        llama_perf_context(ctx_tgt).n_reused,
+                        server_ctx_p0.t_draft_us / 1000.0 / server_ctx_p0.n_cycles,
+                        server_ctx_p0.t_verify_us / 1000.0 / server_ctx_p0.n_cycles,
+                        server_ctx_p0.t_sync_us / 1000.0 / server_ctx_p0.n_cycles);
+            }
+        }
 
         if (ret != 0) {
             {

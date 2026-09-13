@@ -1214,10 +1214,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // decode all sequence's noise block in a single batch
-        int ret = llama_decode(ctx_dft, batch);
-        if (ret != 0) {
-            LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
-            return;
+        {
+            // P0D (2026-09-13): draft 内部拆解——llama_decode 提交 vs 后续 lattice 读取/走链
+            static int64_t t_dd = 0; static int n_dd = 0;
+            const int64_t t0 = ggml_time_us();
+            int ret = llama_decode(ctx_dft, batch);
+            if (ret != 0) {
+                LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
+                return;
+            }
+            t_dd += ggml_time_us() - t0;
+            if (++n_dd % 256 == 0) {
+                fprintf(stderr, "[P0D] draft_decode n=%d avg=%.2fms\n", n_dd, t_dd / 1000.0 / n_dd);
+            }
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
