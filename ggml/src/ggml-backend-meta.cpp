@@ -3,6 +3,7 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
+#include "ggml-trace.h" // TRACELOG 统一仪器日志
 #include "ggml-cpp.h"
 
 #include <algorithm>
@@ -18,6 +19,7 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+#include <atomic>
 
 struct ggml_backend_meta_device;
 struct ggml_backend_meta_buffer_type;
@@ -1963,6 +1965,21 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
 
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(cgraph->grads == nullptr);
+    const int64_t p0m_entry = ggml_time_us(); // P0M: 全函数计时
+    {
+        // P0M-e: 入口配对——计算"调度侧 launch 起点 → 函数入口"的差额
+        extern std::atomic<int64_t> ggml_trace_launch_beg;
+        static std::atomic<int64_t> p0me_n{0}, p0me_gap{0};
+        const int64_t gap = p0m_entry - ggml_trace_launch_beg.load(std::memory_order_relaxed);
+        if (gap >= 0 && gap < 1000000) {
+            p0me_gap.fetch_add(gap, std::memory_order_relaxed);
+        }
+        if (p0me_n.fetch_add(1, std::memory_order_relaxed) % 64 == 0) {
+            TRACELOG("P0M", "[P0M-e] dispatch_gap_avg=%.1fus\n", p0me_gap.load() / 64.0);
+            p0me_gap.store(0);
+        }
+    }
+    static std::atomic<int64_t> p0m_fn{0}, p0m_rebuilds{0}, p0m_ft{0}, p0m_ns{0};
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
 
@@ -2431,10 +2448,43 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
+    // P0M (2026-09-13 B3): meta 全函数 + rebuild/skip 计数直写
+    {
+        {
+            static std::atomic<int64_t> p0mx_n{0};
+            if (p0mx_n.fetch_add(1, std::memory_order_relaxed) % 64 == 0) {
+                TRACELOG("P0M", "[P0M-x] exit_tick=%lld total_us=%lld\n",
+                         (long long) ggml_time_us(), (long long) (ggml_time_us() - p0m_entry));
+            }
+        }
+        p0m_ft.fetch_add(ggml_time_us() - p0m_entry, std::memory_order_relaxed);
+        if (needs_rebuild) {
+            p0m_rebuilds.fetch_add(1, std::memory_order_relaxed);
+        }
+        p0m_ns.fetch_add((int64_t) backend_ctx->n_subgraphs, std::memory_order_relaxed);
+        if (p0m_fn.fetch_add(1, std::memory_order_relaxed) % 64 == 0) {
+            TRACELOG("P0M", "[P0M2] n=%lld rebuilds=%lld pre_fanout_avg=%.3fms nsub_now=%d nsub_avg=%.1f\n",
+                     (long long) p0m_fn.load(), (long long) p0m_rebuilds.load(), p0m_ft.load() / 64000.0,
+                     (int) backend_ctx->n_subgraphs,
+                     p0m_ns.load() / 64.0);
+            p0m_ft.store(0); p0m_rebuilds.store(0); p0m_ns.store(0);
+        }
+    }
+    // fanout: dispatch per-device subgraphs + allreduce(P0M2 在函数尾计全函数耗时)
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
+            const int64_t p0f_t0 = ggml_time_us(); // P0F: fanout 内逐设备计时
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
+            const int64_t p0f_dt = ggml_time_us() - p0f_t0;
+            {
+                static std::atomic<int64_t> p0f_n{0}, p0f_sum{0};
+                p0f_sum.fetch_add(p0f_dt, std::memory_order_relaxed);
+                if (p0f_n.fetch_add(1, std::memory_order_relaxed) % 1024 == 0) {
+                    TRACELOG("P0M", "[P0F] fanout_launch n=%lld avg=%.3fms\n", (long long) p0f_n.load(), p0f_sum.load() / 1024000.0);
+                    p0f_sum.store(0);
+                }
+            }
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
@@ -2461,6 +2511,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
     }
+
     return GGML_STATUS_SUCCESS;
 }
 

@@ -11,12 +11,17 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
+#include "ggml-trace.h" // TRACELOG 统一仪器日志
 #include "ggml-impl.h"
 
 #include <assert.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <atomic>
+#include <map>
+#include <mutex>
+#include <string>
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
@@ -1640,6 +1645,9 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+static std::atomic<int64_t> p0s_ev{0}, p0s_cpy{0}, p0s_lch{0}; // P0S 聚合计数(与函数尾的静态 p0s_n 同期清零)
+std::atomic<int64_t> ggml_trace_launch_beg{0}; // P0M-p: 调度侧 launch 起点 tick(meta 入口配对)
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1650,6 +1658,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    // P0S (2026-09-13): compute_splits 内部计时(event 同步 / 拷贝 / launch)
+    int64_t p0s_t_ev = 0, p0s_t_cpy = 0, p0s_t_lch = 0, p0s_t = ggml_time_us();
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -1658,14 +1669,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+            int64_t t0 = ggml_time_us();
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
             }
+            p0s_t_ev += ggml_time_us() - t0;
         }
 
         // copy the input tensors to the split backend
+        const int64_t p0s_c0 = ggml_time_us(); // P0S: 拷贝循环计时(含事件同步)
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
@@ -1793,7 +1807,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         if (!sched->callback_eval) {
+            p0s_t_cpy += ggml_time_us() - p0s_c0; // P0S: 拷贝循环结束
+            int64_t t0 = ggml_time_us();
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            p0s_t_lch += ggml_time_us() - t0;
+            { // P0S-b: 按后端名累计 launch 时间
+                // P0M-p: 记录本次 launch 起始 tick(meta 入口配对测调度差额)
+                extern std::atomic<int64_t> ggml_trace_launch_beg;
+                ggml_trace_launch_beg.store(t0, std::memory_order_relaxed);
+                static std::mutex p0s_mtx;
+                static std::map<std::string, int64_t> p0s_by_name;
+                std::lock_guard<std::mutex> lk(p0s_mtx);
+                p0s_by_name[ggml_backend_name(split_backend)] += ggml_time_us() - t0;
+                static int64_t p0s_bn_calls = 0;
+                if (++p0s_bn_calls % 64 == 0) {
+                    std::string s;
+                    for (auto & [k2, v2] : p0s_by_name) {
+                        s += " " + k2 + "=" + std::to_string(v2 / 64000.0) + "ms";
+                    }
+                    TRACELOG("P0S", "[P0S-b] by-backend:%s\n", s.c_str());
+                    for (auto & [k2, v2] : p0s_by_name) v2 = 0;
+                }
+            }
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
@@ -1837,6 +1872,49 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         prev_backend_id = split_backend_id;
+    }
+
+    {
+        // P0S 注:计数器按 sched 分高/低两个 bank(目标/draft 两个 sched 各自累计)
+        static std::atomic<int64_t> p0s_n[2] = {0, 0};
+        static std::atomic<int64_t> p0s_evb[2] = {0, 0}, p0s_cpyb[2] = {0, 0}, p0s_lchb[2] = {0, 0};
+        static std::mutex p0s_reg_mtx; static std::vector<const void *> p0s_reg;
+        int bank;
+        {
+            std::lock_guard<std::mutex> lk(p0s_reg_mtx);
+            auto it = std::find(p0s_reg.begin(), p0s_reg.end(), (const void *) sched);
+            if (it == p0s_reg.end()) { p0s_reg.push_back((const void *) sched); it = p0s_reg.end() - 1; }
+            bank = (int) (it - p0s_reg.begin());
+        }
+        if (bank >= 2) bank = 1; // >2 个 sched 时折叠(本机只有 2)
+        p0s_evb[bank].fetch_add(p0s_t_ev, std::memory_order_relaxed);
+        p0s_cpyb[bank].fetch_add(p0s_t_cpy, std::memory_order_relaxed);
+        p0s_lchb[bank].fetch_add(p0s_t_lch, std::memory_order_relaxed);
+        (void) p0s_ev; (void) p0s_cpy; (void) p0s_lch;
+        static std::atomic<int64_t> p0s_rec{0};
+        if (p0s_rec.fetch_add(1, std::memory_order_relaxed) % 32 == 0) {
+            std::string rec = "sched" + std::to_string(bank);
+            for (int i = 0; i < sched->n_splits; i++) {
+                rec += " |" + std::to_string(sched->splits[i].graph.n_nodes) + ":" + ggml_backend_name(sched->backends[sched->splits[i].backend_id]);
+            }
+            rec += " (t=" + std::to_string(ggml_time_us() - p0s_t) + "us @tick=" + std::to_string(ggml_time_us()) + ")";
+            TRACELOG("P0S", "[P0S-r] %s\n", rec.c_str());
+        }
+        if (p0s_n[bank].fetch_add(1, std::memory_order_relaxed) % 128 == 0) {
+            {
+                std::string bks;
+                for (int i = 0; i < sched->n_splits; i++) {
+                    bks += i ? "," : "";
+                    bks += ggml_backend_name(sched->backends[sched->splits[i].backend_id]);
+                }
+                TRACELOG("P0S", "[P0S] sched=%c splits_calls=%lld ev_sync=%.2fms copies=%.2fms launch=%.2fms n_splits_now=%d backends=[%s]\n",
+                         bank ? 'B' : 'A',
+                         (long long) p0s_n[bank].load(),
+                         p0s_evb[bank].load() / 128000.0, p0s_cpyb[bank].load() / 128000.0, p0s_lchb[bank].load() / 128000.0,
+                         sched->n_splits, bks.c_str());
+            }
+            p0s_evb[bank].store(0); p0s_cpyb[bank].store(0); p0s_lchb[bank].store(0);
+        }
     }
 
     return GGML_STATUS_SUCCESS;
@@ -1991,6 +2069,13 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
     GGML_ASSERT(!sched->is_alloc);
 
+    // P0A (2026-09-13 B3): alloc_graph 频率——若稳态每个 verify 都进这里,说明 is_alloc 被莱事重置
+    {
+        static std::atomic<int64_t> p0a_n{0};
+        if (p0a_n.fetch_add(1, std::memory_order_relaxed) % 64 == 0) {
+            TRACELOG("P0A", "[P0A] alloc_graph n=%lld nodes=%d\n", (long long) p0a_n.load(), graph->n_nodes);
+        }
+    }
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 

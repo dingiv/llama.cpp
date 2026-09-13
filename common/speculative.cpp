@@ -12,6 +12,7 @@
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 #include "../src/llama-model.h" // B1-final: draft-private copies of shared output/tok_embd
+#include "ggml-trace.h" // TRACELOG 统一仪器日志
 
 #include <algorithm>
 #include <cassert>
@@ -1239,11 +1240,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     batch_inject.seq_id[i][0] = seq_id;
                     batch_inject.logits[i]    = false;
                 }
-                const int32_t rc = llama_decode(ctx_dft, batch_inject);
-                if (rc != 0) {
-                    LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                            __func__, rc, (int) n_chunk, (int) offset);
-                    return false;
+                // P0I (2026-09-13 B3): inject decode 墙钟(提交口径,GPU 在后续同步点被等)
+                {
+                    static int64_t t_sum = 0; static int n_inj = 0;
+                    const int64_t ti0 = ggml_time_us();
+                    const int32_t rc = llama_decode(ctx_dft, batch_inject);
+                    t_sum += ggml_time_us() - ti0;
+                    if (++n_inj % 256 == 0) {
+                        TRACELOG("P0I", "[P0I] inject_decode n=%d avg=%.2fms\n", n_inj, t_sum / 1000.0 / n_inj);
+                    }
+                    if (rc != 0) {
+                        LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
+                                __func__, rc, (int) n_chunk, (int) offset);
+                        return false;
+                    }
                 }
             }
         }
@@ -1297,7 +1307,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
             t_dd += ggml_time_us() - t0;
             if (++n_dd % 256 == 0) {
-                fprintf(stderr, "[P0D] draft_decode n=%d avg=%.2fms\n", n_dd, t_dd / 1000.0 / n_dd);
+                TRACELOG("P0D", "[P0D] draft_decode n=%d avg=%.2fms\n", n_dd, t_dd / 1000.0 / n_dd);
             }
         }
 

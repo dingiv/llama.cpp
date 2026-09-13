@@ -9,10 +9,12 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "ggml-trace.h" // TRACELOG 统一仪器日志
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -1373,6 +1375,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    // P0C (2026-09-13): 每个 ctx 的 ubatch 宽度/gtype 变化直打(定位谁在变形状)
+    {
+        static thread_local int64_t p0c_last_key = -1;
+        const int64_t p0c_key = ((int64_t) (intptr_t) this) ^ ((int64_t) gtype << 48) ^ ((int64_t) ubatch.n_tokens << 32);
+        if (p0c_key != p0c_last_key) {
+            TRACELOG("P0C", "[P0C] ctx=%ld gtype=%d n_tokens=%d embd=%d\n",
+                     (long) ((intptr_t) this & 0xffffffff), (int) gtype, (int) ubatch.n_tokens, ubatch.embd ? 1 : 0);
+            p0c_last_key = p0c_key;
+        }
+    }
+
+
+    // P0P (2026-09-13): process_ubatch 相位计时(reuse/build/alloc/set_inputs/compute)直写 stderr
+    int64_t p0p_t0 = ggml_time_us(), p0p_t_build = 0, p0p_t_alloc = 0, p0p_t_set = 0, p0p_t_comp = 0;
+    bool p0p_reused = false;
+
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
@@ -1384,6 +1402,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        p0p_reused = true;
     } else {
         res->reset();
 
@@ -1393,6 +1412,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         gf = model.build_graph(gparams);
+        p0p_t_build = ggml_time_us() - p0p_t0;
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1407,6 +1427,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+        p0p_t_alloc = ggml_time_us() - p0p_t0 - p0p_t_build;
     }
 
     // set the input data for the input tensors
@@ -1415,11 +1436,40 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
+        p0p_t_set = ggml_time_us() - p0p_t0 - p0p_t_build - p0p_t_alloc;
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    p0p_t_comp = ggml_time_us() - p0p_t0 - p0p_t_build - p0p_t_alloc - p0p_t_set;
+    {
+        // 双 bank:V = verify(n_outputs==n_tokens 小批),D = 其余(draft inject/noise)
+        static std::atomic<int64_t> p0p_n[2] = {0,0}, p0p_reuse[2] = {0,0}, p0p_tb[2] = {0,0}, p0p_ta[2] = {0,0}, p0p_ts[2] = {0,0}, p0p_tc[2] = {0,0};
+        const int b = (n_outputs == ubatch.n_tokens && ubatch.n_tokens > 0 && ubatch.n_tokens <= 16) ? 0 : 1;
+        p0p_n[b].fetch_add(1, std::memory_order_relaxed);
+        p0p_reuse[b].fetch_add(p0p_reused ? 1 : 0, std::memory_order_relaxed);
+        p0p_tb[b].fetch_add(p0p_t_build, std::memory_order_relaxed);
+        p0p_ta[b].fetch_add(p0p_t_alloc, std::memory_order_relaxed);
+        p0p_ts[b].fetch_add(p0p_t_set, std::memory_order_relaxed);
+        p0p_tc[b].fetch_add(p0p_t_comp, std::memory_order_relaxed);
+        if (b == 0 && p0p_n[0].load() % 64 == 0) {
+            const double k = 1.0 / 64.0;
+            TRACELOG("P0P", "[P0P-V] verify n=%lld reuse%%=%.0f build=%.2fms alloc=%.2fms set=%.2fms compute=%.2fms\n",
+                     (long long) p0p_n[0].load(), 100.0 * p0p_reuse[0].load() * k,
+                     p0p_tb[0].load() * k / 1000.0, p0p_ta[0].load() * k / 1000.0,
+                     p0p_ts[0].load() * k / 1000.0, p0p_tc[0].load() * k / 1000.0);
+            p0p_reuse[0].store(0); p0p_tb[0].store(0); p0p_ta[0].store(0); p0p_ts[0].store(0); p0p_tc[0].store(0);
+        }
+        if (b == 1 && p0p_n[1].load() % 128 == 0) {
+            const double k = 1.0 / 128.0;
+            TRACELOG("P0P", "[P0P-D] draft n=%lld reuse%%=%.0f build=%.2fms alloc=%.2fms set=%.2fms compute=%.2fms\n",
+                     (long long) p0p_n[1].load(), 100.0 * p0p_reuse[1].load() * k,
+                     p0p_tb[1].load() * k / 1000.0, p0p_ta[1].load() * k / 1000.0,
+                     p0p_ts[1].load() * k / 1000.0, p0p_tc[1].load() * k / 1000.0);
+            p0p_reuse[1].store(0); p0p_tb[1].store(0); p0p_ta[1].store(0); p0p_ts[1].store(0); p0p_tc[1].store(0);
+        }
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1730,10 +1780,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
+    // P0L (2026-09-14 B4-2a): llama_decode 机器解剖八段(V=verify 口径,同 P0P-V)
+    int64_t p0l_t[9] = {ggml_time_us(), 0, 0, 0, 0, 0, 0, 0, 0};
+
     if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
+    p0l_t[1] = ggml_time_us();
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
@@ -1766,11 +1820,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
     output_swaps.clear();
 
     sched_reserve();
+    p0l_t[2] = ggml_time_us();
 
     bool did_optimize = false;
 
     // handle any pending shifts/copies
     memory_update(false);
+    p0l_t[3] = ggml_time_us();
 
     llama_memory_context_ptr mctx;
 
@@ -1817,11 +1873,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
         break;
     }
 
+    p0l_t[4] = ggml_time_us(); // memory->init_batch + 状态机
+
     // reserve output buffer
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
+    p0l_t[5] = ggml_time_us(); // output_reserve
 
     // start a new sampling transaction for this logical batch
     for (const auto & entry : sampling.samplers) {
@@ -1853,6 +1912,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         ggml_status status;
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        if (p0l_t[6] == 0) p0l_t[6] = ggml_time_us(); // process_ubatch(P0P 相位在其内)
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -1994,6 +2054,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        p0l_t[7] = ggml_time_us(); // logits/embd/layer_inputs 提取(async D2H 提交)
+
         if (has_samplers) {
             const auto stride = n_vocab;
 
@@ -2007,9 +2069,27 @@ int llama_context::decode(const llama_batch & batch_inp) {
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
+    p0l_t[8] = ggml_time_us(); // sampler 异步拷贝 + ubatch 循环收尾
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
+
+    // P0L 打印(每 64 次 V 口径;顺序:balloc/sched_res/mem_upd/init_batch/out_res/proc_ub/extracts/tail)
+    if (n_outputs_all == n_tokens_all && n_tokens_all > 0 && n_tokens_all <= 16 && p0l_t[8] > 0) {
+        static std::atomic<int64_t> p0l_n{0};
+        static std::atomic<int64_t> p0l_acc[8] = {};
+        for (int k = 0; k < 8; k++) {
+            p0l_acc[k].fetch_add(p0l_t[k + 1] - p0l_t[k], std::memory_order_relaxed);
+        }
+        if (p0l_n.fetch_add(1, std::memory_order_relaxed) % 64 == 0) {
+            TRACELOG("P0L", "[P0L-V] n=%lld balloc=%.2f sched_res=%.2f mem_upd=%.2f init_batch=%.2f out_res=%.2f proc_ub=%.2f extracts=%.2f tail=%.2f | total=%.2f ms\n",
+                     (long long) p0l_n.load(),
+                     p0l_acc[0].load()/64000.0, p0l_acc[1].load()/64000.0, p0l_acc[2].load()/64000.0, p0l_acc[3].load()/64000.0,
+                     p0l_acc[4].load()/64000.0, p0l_acc[5].load()/64000.0, p0l_acc[6].load()/64000.0, p0l_acc[7].load()/64000.0,
+                     (p0l_acc[0].load()+p0l_acc[1].load()+p0l_acc[2].load()+p0l_acc[3].load()+p0l_acc[4].load()+p0l_acc[5].load()+p0l_acc[6].load()+p0l_acc[7].load())/64000.0);
+            for (auto & a : p0l_acc) a.store(0);
+        }
+    }
 
     // set output mappings
     if (n_outputs > 0) {

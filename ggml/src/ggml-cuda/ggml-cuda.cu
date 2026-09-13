@@ -1,4 +1,5 @@
 #include "ggml-cuda.h"
+#include "ggml-trace.h" // TRACELOG 统一仪器日志
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
@@ -2596,7 +2597,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     {
         const int64_t n = p0u_calls.fetch_add(1, std::memory_order_relaxed) + 1;
         if (n % 2048 == 0) {
-            fprintf(stderr, "[P0U] upd_calls=%lld uid_reuse=%lld cmp_stable=%lld\n",
+            TRACELOG("P0U", "[P0U] upd_calls=%lld uid_reuse=%lld cmp_stable=%lld\n",
                     (long long) n, (long long) p0u_uid_reuse.load(), (long long) p0u_cmp_stable.load());
         }
     }
@@ -2619,7 +2620,7 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 
     {
         const int64_t s = p0u_samp.fetch_add(1, std::memory_order_relaxed);
-        p0_dump = (s % 256 == 0) && !res; // 采样:仅同尺寸图,首个失配才有定位意义
+        p0_dump = (s % 16 == 0) && !res; // 稀疏采样:首个失配节点
     }
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -2652,36 +2653,49 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
                     if (x[k] != y[k]) { srcaff = j; srcoff = (int) k; break; }
                 }
             }
-            fprintf(stderr, "[P0G-diff] node=%s op=%d node_struct_diff@byte%d srcaff=%d@%d",
-                    cgraph->nodes[i]->name, (int) prop.node.op, off, srcaff, srcoff);
-            if (off >= 0) {
-                // 关键字段窗口:nb[0..3] 区域与 view_offs 附近各报 16 字节
-                const size_t nb_beg = offsetof(ggml_tensor, nb);
-                const size_t vo_beg = offsetof(ggml_tensor, view_offs);
-                fprintf(stderr, " | nb@%zu vo@%zu | ne=[%lld,%lld,%lld,%lld]->[%lld,%lld,%lld,%lld]",
-                        nb_beg, vo_beg,
-                        (long long) old.node.ne[0], (long long) old.node.ne[1], (long long) old.node.ne[2], (long long) old.node.ne[3],
-                        (long long) prop.node.ne[0], (long long) prop.node.ne[1], (long long) prop.node.ne[2], (long long) prop.node.ne[3]);
-                if (off >= (int) vo_beg && off < (int) (vo_beg + sizeof(size_t))) {
-                    fprintf(stderr, " | VIEW_OFFS %zu->%zu", (size_t) old.node.view_offs, (size_t) prop.node.view_offs);
+            {
+                // 拼单行进 TRACELOG 缓冲(避免热路径多段 fprintf)
+                char p0g_line[1024];
+                int ln = snprintf(p0g_line, sizeof(p0g_line),
+                        "[P0G-diff] dev=%d node=%s op=%d node_struct_diff@byte%d srcaff=%d@%d",
+                        cuda_ctx->device, cgraph->nodes[i]->name, (int) prop.node.op, off, srcaff, srcoff);
+                if (off >= 0) {
+                    // 关键字段窗口:nb[0..3] 区域与 view_offs 附近各报 16 字节
+                    const size_t nb_beg = offsetof(ggml_tensor, nb);
+                    const size_t vo_beg = offsetof(ggml_tensor, view_offs);
+                    ln += snprintf(p0g_line + ln, sizeof(p0g_line) - ln,
+                            " | nb@%zu vo@%zu | ne=[%lld,%lld,%lld,%lld]->[%lld,%lld,%lld,%lld]",
+                            nb_beg, vo_beg,
+                            (long long) old.node.ne[0], (long long) old.node.ne[1], (long long) old.node.ne[2], (long long) old.node.ne[3],
+                            (long long) prop.node.ne[0], (long long) prop.node.ne[1], (long long) prop.node.ne[2], (long long) prop.node.ne[3]);
+                    if (off >= (int) vo_beg && off < (int) (vo_beg + sizeof(size_t))) {
+                        ln += snprintf(p0g_line + ln, sizeof(p0g_line) - ln,
+                                " | VIEW_OFFS %zu->%zu", (size_t) old.node.view_offs, (size_t) prop.node.view_offs);
+                    }
+                    if (off >= (int) nb_beg && off < (int) (nb_beg + 4 * sizeof(size_t))) {
+                        ln += snprintf(p0g_line + ln, sizeof(p0g_line) - ln,
+                                " | NB old=[%zu,%zu,%zu,%zu] new=[%zu,%zu,%zu,%zu]",
+                                old.node.nb[0], old.node.nb[1], old.node.nb[2], old.node.nb[3],
+                                prop.node.nb[0], prop.node.nb[1], prop.node.nb[2], prop.node.nb[3]);
+                    }
                 }
-                if (off >= (int) nb_beg && off < (int) (nb_beg + 4 * sizeof(size_t))) {
-                    fprintf(stderr, " | NB old=[%zu,%zu,%zu,%zu] new=[%zu,%zu,%zu,%zu]",
-                            old.node.nb[0], old.node.nb[1], old.node.nb[2], old.node.nb[3],
-                            prop.node.nb[0], prop.node.nb[1], prop.node.nb[2], prop.node.nb[3]);
+                if (srcaff >= 0) {
+                    ln += snprintf(p0g_line + ln, sizeof(p0g_line) - ln,
+                            " | src%d ne=[%lld,%lld,%lld,%lld]->[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu]->[%zu,%zu,%zu,%zu]",
+                            srcaff,
+                            (long long) old.node_src_ne[srcaff][0], (long long) old.node_src_ne[srcaff][1],
+                            (long long) old.node_src_ne[srcaff][2], (long long) old.node_src_ne[srcaff][3],
+                            (long long) prop.node_src_ne[srcaff][0], (long long) prop.node_src_ne[srcaff][1],
+                            (long long) prop.node_src_ne[srcaff][2], (long long) prop.node_src_ne[srcaff][3],
+                            old.node_src_nb[srcaff][0], old.node_src_nb[srcaff][1], old.node_src_nb[srcaff][2], old.node_src_nb[srcaff][3],
+                            prop.node_src_nb[srcaff][0], prop.node_src_nb[srcaff][1], prop.node_src_nb[srcaff][2], prop.node_src_nb[srcaff][3]);
                 }
+                if (ln < (int) sizeof(p0g_line)) {
+                    p0g_line[ln++] = '\n';
+                    p0g_line[ln] = '\0';
+                }
+                TRACELOG("P0G-diff", "%s", p0g_line);
             }
-            if (srcaff >= 0) {
-                fprintf(stderr, " | src%d ne=[%lld,%lld,%lld,%lld]->[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu]->[%zu,%zu,%zu,%zu]",
-                        srcaff,
-                        (long long) old.node_src_ne[srcaff][0], (long long) old.node_src_ne[srcaff][1],
-                        (long long) old.node_src_ne[srcaff][2], (long long) old.node_src_ne[srcaff][3],
-                        (long long) prop.node_src_ne[srcaff][0], (long long) prop.node_src_ne[srcaff][1],
-                        (long long) prop.node_src_ne[srcaff][2], (long long) prop.node_src_ne[srcaff][3],
-                        old.node_src_nb[srcaff][0], old.node_src_nb[srcaff][1], old.node_src_nb[srcaff][2], old.node_src_nb[srcaff][3],
-                        prop.node_src_nb[srcaff][0], prop.node_src_nb[srcaff][1], prop.node_src_nb[srcaff][2], prop.node_src_nb[srcaff][3]);
-            }
-            fprintf(stderr, "\n");
             p0_dump = false; // 每次采样只打首个失配节点
         }
 
@@ -4494,13 +4508,20 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     // P0G (2026-09-13): CUDA graph 结局计数——直接验证 #27009 的形状抖动杀死 graph 假设
     static std::atomic<int64_t> p0g_calls{0}, p0g_launch{0}, p0g_capture{0}, p0g_direct{0},
         p0g_warm_reset{0}, p0g_warm_churn{0}, p0g_incompat{0}, p0g_not_enabled{0};
+    static std::atomic<int64_t> p0g_d_calls[16]{}, p0g_d_launch[16]{}, p0g_d_churn[16]{}; // P0G-d: 按设备分列
     {
+        const int dev_i = cuda_ctx->device & 15;
+        p0g_d_calls[dev_i].fetch_add(1, std::memory_order_relaxed);
         const int64_t n = p0g_calls.fetch_add(1, std::memory_order_relaxed) + 1;
         if (n % 256 == 0) {
-            fprintf(stderr, "[P0G] calls=%lld launch=%lld capture=%lld direct=%lld warm_reset=%lld warm_churn=%lld incompat=%lld not_enabled=%lld\n",
+            TRACELOG("P0G", "[P0G] calls=%lld launch=%lld capture=%lld direct=%lld warm_reset=%lld warm_churn=%lld incompat=%lld not_enabled=%lld\n",
                     (long long) n, (long long) p0g_launch.load(), (long long) p0g_capture.load(),
                     (long long) p0g_direct.load(), (long long) p0g_warm_reset.load(), (long long) p0g_warm_churn.load(),
                     (long long) p0g_incompat.load(), (long long) p0g_not_enabled.load());
+            TRACELOG("P0G", "[P0G-d] d0: calls=%lld launch=%lld churn=%lld | d1: calls=%lld launch=%lld churn=%lld\n",
+                    (long long) p0g_d_calls[0].load(), (long long) p0g_d_launch[0].load(), (long long) p0g_d_churn[0].load(),
+                    (long long) p0g_d_calls[1].load(), (long long) p0g_d_launch[1].load(), (long long) p0g_d_churn[1].load());
+            for (int d = 0; d < 16; d++) { p0g_d_calls[d].store(0); p0g_d_launch[d].store(0); p0g_d_churn[d].store(0); }
         }
     }
 
@@ -4528,7 +4549,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     static std::atomic<int64_t> p0g_churn_samp{0};
                     if (p0g_churn_samp.fetch_add(1, std::memory_order_relaxed) % 64 == 0) {
                         // 采样:哪个图在抖(uid/n_nodes/首尾节点名)
-                        fprintf(stderr, "[P0G-churn] uid=%zu nodes=%d first=%s last=%s\n",
+                        TRACELOG("P0G", "[P0G-churn] dev=%d uid=%zu nodes=%d first=%s last=%s\n",
+                                 cuda_ctx->device,
                                 (size_t) cgraph->uid, cgraph->n_nodes,
                                 cgraph->nodes[0] ? cgraph->nodes[0]->name : "?",
                                 cgraph->nodes[cgraph->n_nodes-1] ? cgraph->nodes[cgraph->n_nodes-1]->name : "?");
@@ -4548,6 +4570,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                         p0g_capture.fetch_add(1, std::memory_order_relaxed);
                     } else {
                         p0g_launch.fetch_add(1, std::memory_order_relaxed);
+                        p0g_d_launch[cuda_ctx->device & 15].fetch_add(1, std::memory_order_relaxed);
                     }
                 }
             }

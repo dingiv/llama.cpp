@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "ggml-trace.h" // TRACELOG 统一仪器日志
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -9,7 +10,19 @@
 
 // P0 (2026-09-13): spec-decode 相位分解仪——draft/verify 每 cycle 累计,
 // 每 16 周期直写 stderr(绕过 common_log 缓冲黑洞)。dflash-optimize 临时件。
-static struct { int64_t t_draft_us = 0; int64_t t_verify_us = 0; int64_t t_sync_us = 0; int n_cycles = 0; } server_ctx_p0;
+static struct {
+    int64_t t_draft_us = 0; int64_t t_verify_us = 0; int64_t t_sync_us = 0; int n_cycles = 0;
+    // P0T (2026-09-13 B3): 单 cycle 六段时间线
+    int64_t cyc_t0 = 0, t_draft_end = 0, t_ckpt_end = 0, t_last_end = 0, t_prompt_end = 0, t_render_end = 0, t_vsubmit_beg = 0, t_vdecode_end = 0, t_vsync_end = 0, t_inject_end = 0, t_accept_end = 0;
+    bool last_was_verify = false;
+    bool cyc_had_draft = false; // P0T: replay 周期无 draft 桶,时间线残缺不累计
+    int64_t reuse_snap = 0;    // P0O: cycle 头的 n_reused 快照(判 verify 是否重建)
+    int32_t last_width = 0;    // P0O: 本周期最后一次 decode 的批宽
+    int32_t no_draft_reason = 0; // P0O: 0=有draft 1=短draft复用 2=n_draft_max<=0 3=can_speculate假
+    int64_t last_nrem  = -1;   // P0O: 最小剩余生成量(-1=无活跃生成槽)
+    int64_t acc[7] = {0}; int n_tl = 0; // seg 累计: draft, pre_v, vsubmit, vsync, inject, accept, turnaround
+    int64_t acc2[5] = {0}; // pre_v 细分: ckpt, last, prompt, render, entry(render→vsubmit)
+} server_ctx_p0;
 
 #include "build-info.h"
 #include "common.h"
@@ -517,10 +530,23 @@ struct server_slot {
             // no speculative decoding
             i_batch = batch.size();
 
+            auto pos0 = prompt.tokens.pos_next();
+
             if (!inp_embd.empty()) {
-                add_ok &= batch.add(id, inp_embd, prompt.tokens.pos_next(), true, false);
+                add_ok &= batch.add(id, inp_embd, pos0++, true, false);
             } else {
-                add_ok &= batch.add(id, sampled, prompt.tokens.pos_next(), true, false);
+                add_ok &= batch.add(id, sampled, pos0++, true, false);
+            }
+
+            // B1-尾 (2026-09-14 P0O): 生成尾部最后一个周期(n_remaining≤1 → spec 关闭)
+            // 会退回 1 行批,宽度 5→1 大跳变 → L1 miss + meta 重建(+30ms 离群)。
+            // 仅对可投机的 slot 补齐到满宽:dummy 行同样借未来位,生成结束时残留的
+            // 垃圾 KV 因因果 mask 永不可见(下一真实写入覆盖或任务结束回收)。
+            if (n_pad > 0 && can_speculate() && task && task->need_logits()) {
+                const int32_t n_tail_pad = std::min<int32_t>(n_pad, n_ctx - (int32_t) prompt.n_tokens() - 2);
+                for (int32_t i = 1; i <= n_tail_pad; ++i) {
+                    add_ok &= batch.add(this->id, (llama_token) 0, pos0++, true, false);
+                }
             }
 
             SLT_DBG(*this, "slot decode token, id=%d, n_ctx = %d, n_tokens = %d, truncated = %d\n",
@@ -544,8 +570,12 @@ struct server_slot {
             }
 
             // B1 (2026-09-13): pad the remaining rows with dummy tokens (logits on, so n_outputs
-            // stays equal to the width). Capped by the space left in the slot's context.
-            n_pad = std::min(n_pad, get_n_draft_max());
+            // stays equal to the width).
+            // 2026-09-14 P0O 追击:不再用 get_n_draft_max() 收缩 —— 它在生成尾部把宽度
+            // 5→4→3→2→1,每次收缩都是 L1 miss + resplit + meta 重建(+20-40ms 离群)。
+            // dummy 超出 n_predict 的 token 会被 process_token 的限额截断,KV 由同一
+            // seq_rm 回滚,语义安全(见 B1′ 论证);仅保留 n_ctx 硬上限防爆。
+            n_pad = std::min<int32_t>(n_pad, n_ctx - (int32_t) prompt.n_tokens() - 2);
             for (int32_t i = (int32_t) spec_draft.size(); i < n_pad; ++i) {
                 add_ok &= batch.add(this->id, (llama_token) 0, pos0++, true, false);
             }
@@ -2851,6 +2881,7 @@ private:
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
             batch.render();
+            server_ctx_p0.t_render_end = ggml_time_us(); // P0T: render 结束
         } catch (const std::exception & e) {
             SRV_ERR("pre_decode() failed: %s\n", e.what());
             abort_all_slots("pre_decode() failed: " + std::string(e.what()));
@@ -3018,6 +3049,9 @@ private:
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
                 const int n_draft_max = slot.get_n_draft_max();
+                server_ctx_p0.no_draft_reason = n_draft_max > 0
+                    ? (slot.spec_draft.empty() ? 0 : 1)
+                    : (slot.can_speculate() ? 2 : 3);
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
@@ -3036,7 +3070,13 @@ private:
                                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
 
                         if (use_ckpt_dft) {
+                            const int64_t k5 = ggml_time_us();
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            const int64_t k6 = ggml_time_us();
+                            if (k6 - k5 > 150) { // P0K
+                                TRACELOG("P0K", "[P0K] update_dft(save)=%lldus (dft_data=%.2fMiB)\n",
+                                         (long long) (k6 - k5), slot.spec_ckpt.data_dft.size() / 1048576.0);
+                            }
                         }
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
@@ -3059,10 +3099,17 @@ private:
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
             const int64_t p0_t0 = ggml_time_us();
+            if (server_ctx_p0.cyc_t0 > 0) {
+                server_ctx_p0.acc[6] += p0_t0 - server_ctx_p0.cyc_t0; // P0T: turnaround(accept 尾→本 cycle 头)
+            }
+            server_ctx_p0.cyc_t0 = p0_t0;
+            server_ctx_p0.cyc_had_draft = true;
+            server_ctx_p0.reuse_snap = llama_perf_context(ctx_tgt).n_reused; // P0O
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
             server_ctx_p0.t_draft_us += ggml_time_us() - p0_t0;
+            server_ctx_p0.t_draft_end = ggml_time_us();
         }
 
         // make checkpoints if needed
@@ -3076,12 +3123,19 @@ private:
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
             if (ctx_dft) {
+                int64_t k0 = ggml_time_us();
                 if (use_ckpt_dft) {
                     ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
+                int64_t k1 = ggml_time_us();
 
                 if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
                     GGML_ABORT("failed to remove sequence %d\n", slot.id);
+                }
+                int64_t k2 = ggml_time_us();
+                if (k2 - k0 > 150) { // P0K: ckpt 段超制采样
+                    TRACELOG("P0K", "[P0K] load_dft=%lldus seq_rm_dft=%lldus (dft_data=%.2fMiB)\n",
+                             (long long) (k1 - k0), (long long) (k2 - k1), ckpt.data_dft.size() / 1048576.0);
                 }
             }
 
@@ -3094,12 +3148,15 @@ private:
                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft));
 
                 if (use_ckpt_tgt) {
-                    //const int64_t t_start = ggml_time_us();
+                    const int64_t k3 = ggml_time_us();
 
                     ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
-                    //const int64_t t_total = ggml_time_us() - t_start;
-                    //printf("checkpoint total: %f ms\n", t_total / 1000.0);
+                    const int64_t k4 = ggml_time_us();
+                    if (k4 - k3 > 150) { // P0K
+                        TRACELOG("P0K", "[P0K] update_tgt=%lldus (tgt_data=%.2fMiB)\n",
+                                 (long long) (k4 - k3), ckpt.data_tgt.size() / 1048576.0);
+                    }
 
                     SLT_DBG(slot, "created speculative checkpoint (pos_min = %d, pos_max = %d, n_tokens = %d, size = %.3f MiB, draft = %.3f MiB)\n",
                             ckpt.pos_min, ckpt.pos_max, slot.prompt.n_tokens(),
@@ -3112,12 +3169,14 @@ private:
                 }
             }
         });
+        server_ctx_p0.t_ckpt_end = ggml_time_us(); // P0T: ckpt 块结束
 
         // update the batch with the sampled/drafted tokens
         const int32_t n_spec_pad = spec ? common_speculative_n_max(spec.get()) : 0;
         iterate(generating, [&](server_slot & slot) {
             slot.handle_last_sampled_token(batch, n_spec_pad);
         });
+        server_ctx_p0.t_last_end = ggml_time_us(); // P0T: handle_last 结束
 
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
@@ -3659,6 +3718,7 @@ private:
                 }
             });
         }
+        server_ctx_p0.t_prompt_end = ggml_time_us(); // P0T: cont_batching 段结束(pre_decode 尾)
     }
 
     // returns true = success ; false = retry with smaller batch size
@@ -3698,13 +3758,31 @@ private:
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         const int64_t p0_t1 = ggml_time_us();
+        server_ctx_p0.t_vsubmit_beg = p0_t1; // P0T: verify 提交起点
         const bool p0_is_verify = has_output && batch_view.n_tokens <= 16; // P0: spec verify 的小 batch;prefill ubatch=64 被排除
+        if (has_output) {
+            server_ctx_p0.last_width = batch_view.n_tokens;
+        }
         queue_tasks.yield_to_queue([&]() {
+            const int64_t p0_ld0 = ggml_time_us();
             ret = llama_decode(ctx_tgt, batch_view);
+            const int64_t p0_ld1 = ggml_time_us();
+            {
+                // P0Y: llama_decode 纯墙钟 vs yield 外围
+                static std::atomic<int64_t> y_n{0}, y_ld{0};
+                y_ld.fetch_add(p0_ld1 - p0_ld0, std::memory_order_relaxed);
+                if (y_n.fetch_add(1, std::memory_order_relaxed) % 64 == 0) {
+                    TRACELOG("P0Y", "[P0Y] llama_decode avg=%.2fms (n=%lld)\n", y_ld.load() / 64000.0, (long long) y_n.load());
+                    y_ld.store(0);
+                }
+            }
             const int64_t p0_t2 = (ret == 0 && has_output) ? ggml_time_us() : 0;
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
                 server_ctx_p0.t_sync_us += ggml_time_us() - p0_t2; // P0: sync 等待 = GPU 尾部实算
+            }
+            if (ret == 0 && has_output) {
+                server_ctx_p0.t_vdecode_end = p0_t2; // P0T: verify 提交(含 decode 返回)
             }
         });
         // P0W (2026-09-13): verify 宽度直方图(定位 B1 padding 是否生效)
@@ -3712,21 +3790,23 @@ private:
         if (has_output && batch_view.n_tokens <= 16) {
             wcnt[batch_view.n_tokens]++;
             if (server_ctx_p0.n_cycles % 64 == 0) {
-                fprintf(stderr, "[P0W] widths: 1=%d 2=%d 3=%d 4=%d 5=%d 6=%d 8=%d 10=%d 13=%d 16=%d\n",
-                        wcnt[1], wcnt[2], wcnt[3], wcnt[4], wcnt[5], wcnt[6], wcnt[8], wcnt[10], wcnt[13], wcnt[16]);
+                TRACELOG("P0W", "[P0W] widths: 1=%d 2=%d 3=%d 4=%d 5=%d 6=%d 8=%d 10=%d 13=%d 16=%d\n",
+                         wcnt[1], wcnt[2], wcnt[3], wcnt[4], wcnt[5], wcnt[6], wcnt[8], wcnt[10], wcnt[13], wcnt[16]);
             }
         }
         if (p0_is_verify) {
+            server_ctx_p0.t_vsync_end = ggml_time_us(); // P0T: verify 同步结束
+            server_ctx_p0.last_was_verify = true;
             server_ctx_p0.t_verify_us += ggml_time_us() - p0_t1;
             if (++server_ctx_p0.n_cycles % 64 == 0) {
                 // P0 (2026-09-13): 相位分解直写 stderr(绕过 common_log 缓冲黑洞)
-                fprintf(stderr, "[P0] cycles=%d draft_ms=%.1f verify_ms=%.1f sync_ms=%.1f llama_graph_reused=%d | per-cycle draft=%.2fms verify=%.2fms sync=%.2fms\n",
-                        server_ctx_p0.n_cycles,
-                        server_ctx_p0.t_draft_us / 1000.0, server_ctx_p0.t_verify_us / 1000.0, server_ctx_p0.t_sync_us / 1000.0,
-                        llama_perf_context(ctx_tgt).n_reused,
-                        server_ctx_p0.t_draft_us / 1000.0 / server_ctx_p0.n_cycles,
-                        server_ctx_p0.t_verify_us / 1000.0 / server_ctx_p0.n_cycles,
-                        server_ctx_p0.t_sync_us / 1000.0 / server_ctx_p0.n_cycles);
+                TRACELOG("P0", "[P0] cycles=%d draft_ms=%.1f verify_ms=%.1f sync_ms=%.1f llama_graph_reused=%d | per-cycle draft=%.2fms verify=%.2fms sync=%.2fms\n",
+                         server_ctx_p0.n_cycles,
+                         server_ctx_p0.t_draft_us / 1000.0, server_ctx_p0.t_verify_us / 1000.0, server_ctx_p0.t_sync_us / 1000.0,
+                         llama_perf_context(ctx_tgt).n_reused,
+                         server_ctx_p0.t_draft_us / 1000.0 / server_ctx_p0.n_cycles,
+                         server_ctx_p0.t_verify_us / 1000.0 / server_ctx_p0.n_cycles,
+                         server_ctx_p0.t_sync_us / 1000.0 / server_ctx_p0.n_cycles);
             }
         }
 
@@ -3788,9 +3868,12 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             bool ok = true;
+            const int64_t p0t_ti0 = ggml_time_us();
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch_view);
             });
+            server_ctx_p0.t_inject_end = ggml_time_us(); // P0T: inject(含提交)结束
+            (void) p0t_ti0;
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
@@ -3987,13 +4070,29 @@ private:
 
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
+                        // P0R2 (2026-09-14 P0O 追击): replay 回滚三件套计时(restore 是离群嫌疑)
+                        const int64_t p0r2_a = ggml_time_us();
                         ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-
+                        const int64_t p0r2_b = ggml_time_us();
                         if (slot.ctx_dft) {
                             ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
-
+                        const int64_t p0r2_c = ggml_time_us();
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
+                        const int64_t p0r2_d = ggml_time_us();
+                        {
+                            static std::atomic<int64_t> p0r2_n{0}, p0r2_lt{0}, p0r2_ld{0}, p0r2_rm{0};
+                            p0r2_lt.fetch_add(p0r2_b - p0r2_a, std::memory_order_relaxed);
+                            p0r2_ld.fetch_add(p0r2_c - p0r2_b, std::memory_order_relaxed);
+                            p0r2_rm.fetch_add(p0r2_d - p0r2_c, std::memory_order_relaxed);
+                            if (p0r2_n.fetch_add(1, std::memory_order_relaxed) % 16 == 0) {
+                                TRACELOG("P0K", "[P0R2] restore n=%lld load_tgt=%.2fms load_dft=%.2fms seq_rm=%.2fms (tgt_data=%.2fMiB)\n",
+                                         (long long) p0r2_n.load(),
+                                         p0r2_lt.load() / 16000.0, p0r2_ld.load() / 16000.0, p0r2_rm.load() / 16000.0,
+                                         ckpt.data_tgt.size() / 1048576.0);
+                                p0r2_lt.store(0); p0r2_ld.store(0); p0r2_rm.store(0);
+                            }
+                        }
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
@@ -4066,6 +4165,104 @@ private:
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
         });
+
+        // P0T (2026-09-13 B3): 完整 cycle 六段时间线(仅在 spec verify 周期累计)
+        if (server_ctx_p0.last_was_verify && server_ctx_p0.cyc_had_draft && server_ctx_p0.cyc_t0 > 0 && server_ctx_p0.t_inject_end > 0) {
+            server_ctx_p0.t_accept_end = ggml_time_us();
+            auto & P = server_ctx_p0;
+            P.acc[0] += P.t_draft_end   - P.cyc_t0;
+            P.acc[1] += P.t_vsubmit_beg - P.t_draft_end;
+            P.acc2[0] += P.t_ckpt_end   - P.t_draft_end;
+            P.acc2[1] += P.t_last_end   - P.t_ckpt_end;
+            P.acc2[2] += P.t_prompt_end - P.t_last_end;
+            P.acc2[3] += P.t_render_end - P.t_prompt_end;
+            P.acc2[4] += P.t_vsubmit_beg - P.t_render_end;
+            P.acc[2] += P.t_vdecode_end - P.t_vsubmit_beg;
+            P.acc[3] += P.t_vsync_end   - P.t_vdecode_end;
+            P.acc[4] += P.t_inject_end  - P.t_vsync_end;
+            P.acc[5] += P.t_accept_end  - P.t_inject_end;
+            if (++P.n_tl % 64 == 0) {
+                TRACELOG("P0T", "[P0T] n=%d | draft=%.2f [ckpt=%.2f last=%.2f prompt=%.2f render=%.2f entry=%.2f] vsubmit=%.2f vsync=%.2f inject=%.2f accept=%.2f turnaround=%.2f | total=%.2f ms\n",
+                         P.n_tl,
+                         P.acc[0]/64000.0,
+                         P.acc2[0]/64000.0, P.acc2[1]/64000.0, P.acc2[2]/64000.0, P.acc2[3]/64000.0, P.acc2[4]/64000.0,
+                         P.acc[2]/64000.0, P.acc[3]/64000.0,
+                         P.acc[4]/64000.0, P.acc[5]/64000.0, P.acc[6]/64000.0,
+                         (P.acc[0]+P.acc[1]+P.acc[2]+P.acc[3]+P.acc[4]+P.acc[5]+P.acc[6])/64000.0);
+                tracelog::flush(); // P0T:批量输出安全点(每 64 cycle 一次)
+                memset(P.acc, 0, sizeof(P.acc));
+                memset(P.acc2, 0, sizeof(P.acc2));
+            }
+            P.cyc_t0 = ggml_time_us(); // 下一 cycle 起点由 draft 桶覆盖;此处兼作 turnaround 终点基准
+            P.last_was_verify = false;
+            P.cyc_had_draft = false;
+            P.t_inject_end = 0;
+        }
+
+        // P0O (2026-09-14): cycle 级离群值检测 —— 真实周期 = 相邻 accept 结束点间隔,
+        // 覆盖所有周期类型(含 replay);中位数 1.5x 或 +10ms 即报,附带该周期段分解
+        {
+            static int64_t p0o_last_end = 0;
+            static int64_t p0o_ring[32] = {0};
+            static int     p0o_idx = 0, p0o_count = 0;
+            static int64_t p0o_n_out = 0;
+            const int64_t p0o_now = ggml_time_us();
+
+            if (p0o_last_end > 0) {
+                const int64_t p0o_period = p0o_now - p0o_last_end;
+
+                if (p0o_period > 0 && p0o_period < 200000) { // >200ms 视为空闲间隙,丢弃
+                    p0o_ring[p0o_idx] = p0o_period;
+                    p0o_idx = (p0o_idx + 1) % 32;
+                    p0o_count++;
+
+                    if (p0o_count >= 32) {
+                        int64_t p0o_tmp[32];
+                        memcpy(p0o_tmp, p0o_ring, sizeof(p0o_tmp));
+                        std::nth_element(p0o_tmp, p0o_tmp + 16, p0o_tmp + 32);
+                        const int64_t p0o_med = p0o_tmp[16];
+                        const int64_t p0o_thr = std::max(p0o_med + (p0o_med >> 1), p0o_med + 10000);
+
+                        if (p0o_period > p0o_thr) {
+                            p0o_n_out++;
+                            auto & P = server_ctx_p0;
+                            const int64_t p0o_rd = P.cyc_had_draft
+                                ? (llama_perf_context(ctx_tgt).n_reused - P.reuse_snap) : -1;
+                            int64_t p0o_nrem = -1;
+                            for (const auto & sl : slots) {
+                                if (sl.state == SLOT_STATE_GENERATING) {
+                                    p0o_nrem = (p0o_nrem < 0) ? (int64_t) sl.n_remaining() : std::min<int64_t>(p0o_nrem, sl.n_remaining());
+                                }
+                            }
+                            TRACELOG("P0O", "[P0O] OUTLIER period=%.1fms (med=%.1f) type=%s rsn=%d verify_reused=%d width=%d nrem=%lld | draft=%.2f ckpt=%.2f vsubmit=%.2f vsync=%.2f inject=%.2f accept=%.2f turn=%.2f\n",
+                                     p0o_period / 1000.0, p0o_med / 1000.0,
+                                     P.cyc_had_draft ? "draft" : "replay",
+                                     (int) server_ctx_p0.no_draft_reason,
+                                     (int) p0o_rd, (int) server_ctx_p0.last_width, (long long) p0o_nrem,
+                                     (P.t_draft_end - P.cyc_t0) / 1000.0,
+                                     (P.t_ckpt_end - P.t_draft_end) / 1000.0,
+                                     (P.t_vdecode_end - P.t_vsubmit_beg) / 1000.0,
+                                     (P.t_vsync_end - P.t_vdecode_end) / 1000.0,
+                                     (P.t_inject_end > 0 ? P.t_inject_end - P.t_vsync_end : 0) / 1000.0,
+                                     (ggml_time_us() - (P.t_inject_end > 0 ? P.t_inject_end : P.t_vsync_end)) / 1000.0,
+                                     (P.cyc_t0 > 0 && P.t_accept_end > P.cyc_t0 ? 0 : 0) / 1000.0);
+                        }
+                    }
+
+                    if (p0o_count % 512 == 0) {
+                        int64_t p0o_tmp[32];
+                        memcpy(p0o_tmp, p0o_ring, sizeof(p0o_tmp));
+                        std::sort(p0o_tmp, p0o_tmp + 32);
+                        TRACELOG("P0O", "[P0O-hist] n=%d p12=%.1f p50=%.1f p87=%.1f max=%.1f outliers=%lld\n",
+                                 p0o_count,
+                                 p0o_tmp[3] / 1000.0, p0o_tmp[15] / 1000.0, p0o_tmp[27] / 1000.0,
+                                 p0o_tmp[31] / 1000.0, (long long) p0o_n_out);
+                        p0o_n_out = 0;
+                    }
+                }
+            }
+            p0o_last_end = p0o_now;
+        }
     }
 
     // context size of a single slot, capped by --kv-unified-per-slot and by the training context of the model
