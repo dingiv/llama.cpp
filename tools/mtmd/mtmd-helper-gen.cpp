@@ -567,26 +567,32 @@ private:
     std::vector<uint8_t> c2w_state;
 
     // run-to-run vocoder gain varies noticeably (especially with instruct
-    // conditioning); normalize each output to -20 dBFS RMS with a -1 dBFS peak
-    // ceiling so callers get a consistent level
+    // conditioning); normalize each output to -20 dBFS RMS. Isolated peaks are
+    // handled by a soft-knee limiter instead of a global peak cap — a single-sample
+    // spike would otherwise crush the whole take's gain (angry/emotional takes
+    // decoded 5-15 dB quieter than neutral ones because of this).
     void normalize_loudness() {
         if (audio_pcm.empty()) {
             return;
         }
         double sum_sq = 0.0;
-        float peak = 0.0f;
         for (float v : audio_pcm) {
             sum_sq += (double) v * v;
-            peak = std::max(peak, std::fabs(v));
         }
         const float rms = std::sqrt((float) (sum_sq / audio_pcm.size()));
-        if (rms <= 1e-4f || peak <= 1e-4f) {
+        if (rms <= 1e-4f) {
             return;
         }
-        const float gain = std::min(0.1f / rms, 0.891f / peak);
-        if (gain > 0.001f) {
-            for (float & v : audio_pcm) {
-                v *= gain;
+        constexpr float kRmsTarget   = 0.1f;  // -20 dBFS
+        constexpr float kLimiterKnee = 0.7f;  // soft-clip above this, asymptotic to 1.0
+        const float gain = kRmsTarget / rms;
+        for (float & v : audio_pcm) {
+            v *= gain;
+            const float a = std::fabs(v);
+            if (a > kLimiterKnee) {
+                const float limited = kLimiterKnee +
+                                      (1.0f - kLimiterKnee) * std::tanh((a - kLimiterKnee) / (1.0f - kLimiterKnee));
+                v = v < 0 ? -limited : limited;
             }
         }
     }
