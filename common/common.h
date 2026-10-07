@@ -761,6 +761,10 @@ struct common_params {
     // TTS params
     std::string tts_lang = "";
     std::string tts_speaker_file = "";
+    // Qwen3-TTS custom_voice: named speaker from the model's built-in table, and a
+    // natural-language style instruction prepended as a ChatML user turn
+    std::string tts_speaker_name = "";
+    std::string tts_instruct = "";
 
     bool is_gen_docs = false; // whether we are running inside llama-gen-docs
 };

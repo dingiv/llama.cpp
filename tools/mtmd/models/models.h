@@ -248,8 +248,8 @@ struct clip_graph_qwen3tts_spkenc : clip_graph {
 };
 
 struct clip_graph_qwen3tts_gen : clip_graph {
-    clip_graph_qwen3tts_gen(clip_ctx * ctx, const clip_image_f32 & img, clip_gen_process_type gen_process, int top_k, float top_p)
-        : clip_graph(ctx, img), gen_process(gen_process), top_k(top_k), top_p(top_p) {}
+    clip_graph_qwen3tts_gen(clip_ctx * ctx, const clip_image_f32 & img, clip_gen_process_type gen_process, int top_k, float top_p, float temp)
+        : clip_graph(ctx, img), gen_process(gen_process), top_k(top_k), top_p(top_p), temp(temp) {}
     ggml_cgraph * build() override;
 
     // which sub-graph build() constructs, fixed at graph-build time
@@ -258,18 +258,20 @@ struct clip_graph_qwen3tts_gen : clip_graph {
     // sampling params, fixed at graph-build time (GEN_CODE only)
     int   top_k;
     float top_p;
+    float temp;
 
     //
     // code_gen: backbone hidden state + sampled code0 -> 16 RVQ codes
     // MTP-style code predictor, one token per codebook
     //
     struct code_gen : clip_graph {
-        code_gen(const clip_graph & parent, int top_k, float top_p)
-            : clip_graph(parent), top_k(top_k), top_p(top_p) {}
+        code_gen(const clip_graph & parent, int top_k, float top_p, float temp)
+            : clip_graph(parent), top_k(top_k), top_p(top_p), temp(temp) {}
         ggml_cgraph * build() override { GGML_ABORT("call prefill()/step() instead"); }
 
         int   top_k;
         float top_p;
+        float temp; // softmax temperature for the semantic/acoustic code sampling
 
         ggml_tensor * cache_set(ggml_tensor * cache, int row_idx, ggml_tensor * value) const;
         ggml_tensor * do_sampling(ggml_tensor * logits, ggml_tensor * inp_rand) const;

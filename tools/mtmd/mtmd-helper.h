@@ -211,6 +211,11 @@ struct mtmd_helper_gen_audio_inp {
 
     mtmd_bitmap * speaker_ref; // optional, can be NULL
     const char * lang; // optional, can be NULL
+    // Qwen3-TTS custom_voice: named speaker (looked up in the model's built-in
+    // spk table, ignored when speaker_ref is set) and an optional natural-language
+    // style instruction, prepended to the prompt as a ChatML user turn
+    const char * speaker_name; // optional, can be NULL
+    const char * instruct;     // optional, can be NULL
 
     int32_t  top_k;
     float    top_p;

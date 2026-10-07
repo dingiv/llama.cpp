@@ -1128,7 +1128,8 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
                 const auto  gen_process = params ? params->gen_process : CLIP_GEN_PROCESS_GEN_CODE;
                 const int   top_k = params ? params->top_k : 50;
                 const float top_p = params ? params->top_p : 1.0f;
-                builder = std::make_unique<clip_graph_qwen3tts_gen>(ctx, img, gen_process, top_k, top_p);
+                const float temp  = params ? params->temp  : 0.9f;
+                builder = std::make_unique<clip_graph_qwen3tts_gen>(ctx, img, gen_process, top_k, top_p, temp);
             } break;
         case PROJECTOR_TYPE_YOUTUVL:
             {

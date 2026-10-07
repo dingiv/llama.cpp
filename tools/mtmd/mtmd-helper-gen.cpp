@@ -8,6 +8,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -76,6 +77,38 @@ static bool write_wav16(std::vector<char> & buf, const std::vector<float> & pcm,
     return true;
 }
 
+// minimal flat {"key": value} parser (values: integers or strings, no nesting),
+// used for the qwen3tts.spk_id / qwen3tts.spk_is_dialect model metadata maps
+static std::map<std::string, std::string> parse_flat_json_map(const std::string & json) {
+    std::map<std::string, std::string> out;
+    size_t i = 0;
+    while (i < json.size()) {
+        const size_t key_open = json.find('"', i);
+        if (key_open == std::string::npos) break;
+        const size_t key_close = json.find('"', key_open + 1);
+        if (key_close == std::string::npos) break;
+        std::string key = json.substr(key_open + 1, key_close - key_open - 1);
+        const size_t colon = json.find(':', key_close + 1);
+        if (colon == std::string::npos) break;
+        const size_t v = json.find_first_not_of(" \t", colon + 1);
+        if (v == std::string::npos) break;
+        std::string val;
+        if (json[v] == '"') {
+            const size_t end = json.find('"', v + 1);
+            if (end == std::string::npos) break;
+            val = json.substr(v + 1, end - v - 1);
+            i = end + 1;
+        } else {
+            const size_t end = json.find_first_of(",}", v);
+            if (end == std::string::npos) break;
+            val = json.substr(v, end - v);
+            i = end;
+        }
+        out[key] = val;
+    }
+    return out;
+}
+
 class mtmd_gen_audio_pipeline {
 public:
     mtmd_gen_audio_pipeline(llama_context * lctx, mtmd_context * mctx)
@@ -106,7 +139,10 @@ protected:
 // then code2wav decodes them to PCM
 class qwen3tts_gen_audio_pipeline : public mtmd_gen_audio_pipeline {
 public:
-    using mtmd_gen_audio_pipeline::mtmd_gen_audio_pipeline;
+    qwen3tts_gen_audio_pipeline(llama_context * lctx, mtmd_context * mctx)
+        : mtmd_gen_audio_pipeline(lctx, mctx) {
+        load_speaker_table();
+    }
 
     void reset() override {
         seq_id = 0;
@@ -131,18 +167,52 @@ public:
             return 1;
         }
 
-        const std::string lang   = tts_resolve_lang((inp->lang && inp->lang[0]) ? inp->lang : "english");
-        const llama_token c_lang = find_special_token(vocab, ("<|codec_language_" + lang + "|>").c_str());
-        if (c_lang == LLAMA_TOKEN_NULL) {
-            LOG_ERR("mtmd_helper_gen_audio: unknown language '%s'\n", lang.c_str());
-            return 1;
-        }
-
+        // resolve the named speaker first: the dialect flag may override the language tag
         std::vector<float> speaker_embd;
         if (inp->speaker_ref) {
             if (!encode_speaker(inp->speaker_ref, speaker_embd)) {
                 return 1;
             }
+        }
+        speaker_name = inp->speaker_name ? inp->speaker_name : "";
+        instruct     = inp->instruct ? inp->instruct : "";
+
+        std::string lang = tts_resolve_lang((inp->lang && inp->lang[0]) ? inp->lang : "english");
+        if (!speaker_name.empty()) {
+            std::string key = speaker_name;
+            std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return std::tolower(c); });
+            auto it = spk_ids.find(key);
+            if (it == spk_ids.end()) {
+                std::string avail;
+                for (auto & [n, id] : spk_ids) {
+                    avail += (avail.empty() ? "" : ", ") + n;
+                }
+                LOG_ERR("mtmd_helper_gen_audio: unknown speaker '%s' (available: %s)\n",
+                        speaker_name.c_str(), avail.c_str());
+                return 1;
+            }
+            // dialect speakers remap the language tag for Chinese input (upstream:
+            // spk_is_dialect[speaker] overrides codec_language_id)
+            auto dit = spk_dialect.find(key);
+            if (dit != spk_dialect.end() && !dit->second.empty() && lang == "chinese") {
+                lang = dit->second;
+            }
+            const llama_token spk_tok = it->second;
+            if (spk_tok < 0 || (size_t)(spk_tok + 1) * n_embd > tok_embd.size()) {
+                LOG_ERR("mtmd_helper_gen_audio: speaker '%s' id %d out of range\n",
+                        speaker_name.c_str(), (int) spk_tok);
+                return 1;
+            }
+            // upstream conditions on the same table: speaker_embed =
+            // talker.get_input_embeddings()(spk_id), no projection on top
+            speaker_embd.assign(tok_embd.begin() + (size_t) spk_tok * n_embd,
+                                tok_embd.begin() + (size_t)(spk_tok + 1) * n_embd);
+        }
+
+        const llama_token c_lang = find_special_token(vocab, ("<|codec_language_" + lang + "|>").c_str());
+        if (c_lang == LLAMA_TOKEN_NULL) {
+            LOG_ERR("mtmd_helper_gen_audio: unknown language '%s'\n", lang.c_str());
+            return 1;
         }
 
         const int n_e = n_embd;
@@ -174,6 +244,19 @@ public:
         ids.resize((size_t) n_ids);
 
         std::vector<std::vector<float>> prompt;
+        if (!instruct.empty()) {
+            // upstream prepends the instruction as a ChatML user turn: plain text rows,
+            // no codec overlay (modeling_qwen3_tts.py _build_instruct_text)
+            const std::string itxt = "<|im_start|>user\n" + instruct + "<|im_end|>\n";
+            std::vector<llama_token> iids(itxt.size() + 16);
+            const int n_i = llama_tokenize(vocab, itxt.c_str(), (int32_t) itxt.size(),
+                                           iids.data(), (int32_t) iids.size(), false, true);
+            if (n_i <= 0) {
+                LOG_ERR("mtmd_helper_gen_audio: instruction tokenization failed\n");
+                return 1;
+            }
+            for (int i = 0; i < n_i; i++) prompt.push_back(row(iids[(size_t) i]));
+        }
         for (int i = 0; i < 3; i++) prompt.push_back(row(ids[(size_t) i]));
         prompt.push_back(sum_row(tts_pad, c_think));
         prompt.push_back(sum_row(tts_pad, c_think_b));
@@ -316,6 +399,8 @@ public:
             return 0;
         }
 
+        normalize_loudness();
+
         out_buf.clear();
         if (!write_wav16(out_buf, audio_pcm, info.sample_rate)) {
             LOG_ERR("mtmd_helper_gen_audio: output too large for WAV\n");
@@ -433,6 +518,36 @@ private:
     llama_token tts_eos    = LLAMA_TOKEN_NULL;
     std::vector<float> tok_embd; // whole token embedding matrix, n_vocab * n_embd
 
+    // custom_voice: named-speaker table from model metadata (empty for Base models);
+    // spk row is read straight out of tok_embd (upstream indexes the same table)
+    std::map<std::string, llama_token> spk_ids;
+    std::map<std::string, std::string> spk_dialect; // name -> dialect language key ("" = none)
+    std::string speaker_name;
+    std::string instruct;
+
+    // read qwen3tts.* metadata KVs written by conversion/qwen3tts.py (custom_voice)
+    void load_speaker_table() {
+        std::vector<char> buf(2048);
+        int32_t n = llama_model_meta_val_str(model, "qwen3tts.tts_model_type", buf.data(), buf.size());
+        if (n <= 0 || std::string(buf.data()) != "custom_voice") {
+            return; // Base model: reference-audio cloning only
+        }
+        n = llama_model_meta_val_str(model, "qwen3tts.spk_id", buf.data(), buf.size());
+        if (n <= 0) {
+            LOG_ERR("mtmd_helper_gen_audio: custom_voice model without qwen3tts.spk_id metadata\n");
+            return;
+        }
+        for (auto & [name, val] : parse_flat_json_map(std::string(buf.data(), n))) {
+            spk_ids[name] = (llama_token) std::stoi(val);
+        }
+        n = llama_model_meta_val_str(model, "qwen3tts.spk_is_dialect", buf.data(), buf.size());
+        if (n > 0) {
+            for (auto & [name, val] : parse_flat_json_map(std::string(buf.data(), n))) {
+                spk_dialect[name] = val == "false" ? "" : val;
+            }
+        }
+    }
+
     // must match hparams.wav_tfm_swa hardcoded in clip.cpp
     size_t window_frames = 72;
 
@@ -450,6 +565,31 @@ private:
     uint32_t seed  = UINT32_MAX;
     std::vector<int32_t> codes_buf;
     std::vector<uint8_t> c2w_state;
+
+    // run-to-run vocoder gain varies noticeably (especially with instruct
+    // conditioning); normalize each output to -20 dBFS RMS with a -1 dBFS peak
+    // ceiling so callers get a consistent level
+    void normalize_loudness() {
+        if (audio_pcm.empty()) {
+            return;
+        }
+        double sum_sq = 0.0;
+        float peak = 0.0f;
+        for (float v : audio_pcm) {
+            sum_sq += (double) v * v;
+            peak = std::max(peak, std::fabs(v));
+        }
+        const float rms = std::sqrt((float) (sum_sq / audio_pcm.size()));
+        if (rms <= 1e-4f || peak <= 1e-4f) {
+            return;
+        }
+        const float gain = std::min(0.1f / rms, 0.891f / peak);
+        if (gain > 0.001f) {
+            for (float & v : audio_pcm) {
+                v *= gain;
+            }
+        }
+    }
     std::vector<float>   audio_pcm;
     std::vector<float> overlay;
     std::vector<float> h_state_buf;

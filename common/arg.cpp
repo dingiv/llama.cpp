@@ -4463,6 +4463,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.tts_speaker_file = value;
         }
     ).set_examples({LLAMA_EXAMPLE_TTS}));
+    add_opt(common_arg(
+        {"--tts-speaker"}, "NAME",
+        "named speaker for custom_voice TTS models (e.g. Vivian, Ryan); "
+        "mutually exclusive with --tts-speaker-file",
+        [](common_params & params, const std::string & value) {
+            params.tts_speaker_name = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_TTS}));
+    add_opt(common_arg(
+        {"--tts-instruct"}, "TEXT",
+        "natural-language style instruction for custom_voice TTS models "
+        "(e.g. \"Speak in an angry tone\"); empty by default",
+        [](common_params & params, const std::string & value) {
+            params.tts_instruct = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_TTS}));
 
     //
     // diffusion params

@@ -36,7 +36,8 @@ static void print_usage(int, char ** argv) {
     LOG("\nexample usage:\n");
     LOG("\n    %s -m backbone.gguf -mm mmproj.gguf -p \"text to speak\" -o output.wav", argv[0]);
     LOG("\n    %s -hf user/model -p \"text to speak\" -o output.wav\n", argv[0]);
-    LOG("\nnote: --tts-lang and --tts-speaker-file may not be supported in all models");
+    LOG("\nnote: --tts-lang, --tts-speaker-file, --tts-speaker and --tts-instruct may not be supported in all models");
+    LOG("\n      custom_voice models: use --tts-speaker Vivian --tts-instruct \"Use an angry tone\"");
     LOG("\n      use -n to limit the output length");
     LOG("\n      see tts/README.md for per-model usage notes");
     LOG("\n\n");
@@ -103,6 +104,10 @@ int main(int argc, char ** argv) {
 
     mtmd::bitmap_ptr speaker_bitmap;
     if (!params.tts_speaker_file.empty()) {
+        if (!params.tts_speaker_name.empty()) {
+            LOG_ERR("--tts-speaker and --tts-speaker-file are mutually exclusive\n");
+            return 1;
+        }
         auto wrapper = mtmd_helper_bitmap_init_from_file(mctx.get(), params.tts_speaker_file.c_str(), false, mtmd_helper_init_opt_default());
         if (!wrapper.bitmap) {
             LOG_ERR("failed to load speaker file %s\n", params.tts_speaker_file.c_str());
@@ -113,15 +118,17 @@ int main(int argc, char ** argv) {
 
     mtmd_helper::gen_audio gen(lctx, mctx.get());
     mtmd_helper_gen_audio_inp inp{};
-    inp.seq_id      = 0;
-    inp.prompt      = params.prompt.c_str();
-    inp.prompt_len  = params.prompt.size();
-    inp.speaker_ref = speaker_bitmap.get();
-    inp.lang        = params.tts_lang.c_str();
-    inp.top_k       = params.sampling.top_k;
-    inp.top_p       = params.sampling.top_p;
-    inp.seed        = params.sampling.seed;
-    inp.out_type    = MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV;
+    inp.seq_id       = 0;
+    inp.prompt       = params.prompt.c_str();
+    inp.prompt_len   = params.prompt.size();
+    inp.speaker_ref  = speaker_bitmap.get();
+    inp.lang         = params.tts_lang.c_str();
+    inp.speaker_name = params.tts_speaker_name.c_str();
+    inp.instruct     = params.tts_instruct.c_str();
+    // note: top_k/top_p intentionally left 0 so the pipeline's upstream-tuned
+    // defaults apply (Qwen3-TTS: top_k 50, top_p 1.0, temp 0.9)
+    inp.seed         = params.sampling.seed;
+    inp.out_type     = MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV;
 
     //
     // stage 1: process prompt via backbone model, generate semantic representation

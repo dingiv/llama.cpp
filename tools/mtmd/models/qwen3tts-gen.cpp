@@ -7,6 +7,13 @@ ggml_tensor * clip_graph_qwen3tts_gen::code_gen::do_sampling(ggml_tensor * logit
     logits = ggml_reshape_1d(ctx0, logits, ggml_nelements(logits));
     const int64_t n_vocab = logits->ne[0];
 
+    // temperature (upstream generation_config.json: 0.9; resolves the old
+    // "TODO: handle this on graph" — without it, sampling entropy is too high and
+    // the vocoder occasionally decodes to much quieter waveforms)
+    if (temp > 0.0f && temp != 1.0f) {
+        logits = ggml_scale(ctx0, logits, 1.0f / temp);
+    }
+
     // sort a's rows by idx
     auto sort_by = [this](ggml_tensor * a, ggml_tensor * idx) {
         ggml_tensor * a2d = ggml_reshape_2d(ctx0, a, 1, a->ne[0]);
@@ -693,7 +700,7 @@ ggml_cgraph * clip_graph_qwen3tts_gen::build() {
         v_cache[il] = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d_head * n_head_kv, n_kv_pad), 0.0f);
     }
 
-    code_gen cg(*this, top_k, top_p);
+    code_gen cg(*this, top_k, top_p, temp);
 
     ggml_tensor * out_code_cache = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_codes);
     out_code_cache = cg.cache_set(out_code_cache, 0, code0);
